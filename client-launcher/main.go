@@ -68,6 +68,11 @@ const (
 	cooldownFloor = 30 * time.Minute
 )
 
+// heartbeatEvery keeps the server-side BUSY lease alive. The control plane
+// reclaims a lease after 120s of silence, so this must stay well below that.
+// A var so tests can shorten it.
+var heartbeatEvery = 30 * time.Second
+
 var version = "dev"
 
 // kernelURLDefault is baked in at build time so a customer binary works with no
@@ -164,19 +169,18 @@ func main() {
 	gateway := set.String("gateway", envOr("CCE_GATEWAY", ""), "gateway host:port override")
 	claudeBin := set.String("claude", "claude", "path to the claude binary")
 	runtimeDir := set.String("runtime", "", "desktop mode: directory holding the browser kernel")
-	keep := set.Bool("keep", false, "leave credentials on disk (skip the post-exit wipe)")
 	verbose := set.Bool("v", false, "verbose")
 	own, claudeArgs := splitArgs(os.Args[2:], func(name string) bool {
 		switch name {
 		case "key", "secret", "host", "gateway", "claude", "runtime":
 			return true // takes a value
-		case "keep", "v":
+		case "v":
 			return false
 		}
 		return false
 	}, func(name string) bool {
 		switch name {
-		case "key", "secret", "host", "gateway", "claude", "runtime", "keep", "v":
+		case "key", "secret", "host", "gateway", "claude", "runtime", "v":
 			return true
 		}
 		return false
@@ -209,6 +213,15 @@ func main() {
 	}
 	client.secret = *secret
 
+	// A previous run may have been killed before its wipe. Clear the plaintext
+	// credential directories before reserving an account, so a leftover token is
+	// never mistaken for this session's (and never survives on a shared box).
+	root, err := stateRoot()
+	if err != nil {
+		fail("%v", err)
+	}
+	pruneResidualCredentials(root)
+
 	// Kill switch first: everything below assumes the account's IP is live.
 	sess, err := client.session(ctx)
 	if err != nil {
@@ -226,15 +239,16 @@ func main() {
 		sess.Tunnel.Host, sess.Tunnel.Port = host, parsed
 	}
 
-	root, err := stateRoot()
-	if err != nil {
-		abortSession(client, ctx, statusIdle, "%v", err)
-	}
 	proxy, err := startLoopbackProxy(sess, *verbose)
 	if err != nil {
 		abortSession(client, ctx, statusIdle, "%v", err)
 	}
 	defer proxy.Close()
+
+	// Hold the server-side lease for the whole session, not just at startup:
+	// the control plane reclaims a BUSY profile after 120s without a heartbeat.
+	stopBeating := keepAlive(ctx, client)
+	defer stopBeating()
 
 	observed, err := proxy.probe(ctx)
 	if err != nil {
@@ -249,7 +263,7 @@ func main() {
 
 	switch mode {
 	case "cli":
-		err = runCLI(ctx, client, sess, root, proxy, *claudeBin, *keep, claudeArgs)
+		err = runCLI(ctx, client, sess, root, proxy, *claudeBin, claudeArgs)
 	case "desktop":
 		err = runDesktop(ctx, sess, root, proxy, *runtimeDir)
 		client.report(ctx, outcome{status: statusIdle})
@@ -619,7 +633,7 @@ func (p *loopback) trace(format string, args ...any) {
 
 // -- cli mode --------------------------------------------------------------
 
-func runCLI(ctx context.Context, client *apiClient, sess *session, root string, proxy *loopback, claudeBin string, keep bool, claudeArgs []string) error {
+func runCLI(ctx context.Context, client *apiClient, sess *session, root string, proxy *loopback, claudeBin string, claudeArgs []string) error {
 	reported := false
 	defer func() {
 		if !reported {
@@ -630,11 +644,11 @@ func runCLI(ctx context.Context, client *apiClient, sess *session, root string, 
 	if err := refreshCredentials(ctx, client, sess, configDir); err != nil {
 		return err
 	}
-	if !keep {
-		// The account's tokens exist only for this session; a stale copy on a
-		// shared machine is a liability.
-		defer func() { _ = os.RemoveAll(filepath.Join(root, "profiles", sess.ProfileID)) }()
-	}
+	// The account's tokens exist only for this session; a stale plaintext copy
+	// on a shared machine is a liability, so the wipe is unconditional. The
+	// deferred removal also runs on Ctrl-C, because exec.CommandContext only
+	// kills the child and runCLI still returns normally.
+	defer func() { _ = os.RemoveAll(filepath.Join(root, "profiles", sess.ProfileID)) }()
 
 	binary, err := exec.LookPath(claudeBin)
 	if err != nil {
@@ -797,6 +811,70 @@ func (t *tailBuffer) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return string(t.data)
+}
+
+// keepAlive heartbeats the control plane until the returned stop function is
+// called, so the server-side BUSY lease does not expire during a long session.
+func keepAlive(ctx context.Context, client *apiClient) func() {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(heartbeatEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				// A stop that already happened wins over a tick that is only
+				// now being delivered, so the count is final once stop returns.
+				select {
+				case <-done:
+					return
+				default:
+				}
+				beatCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
+				if err := client.heartbeat(beatCtx, ""); err != nil {
+					log.Printf("warning: heartbeat failed: %v", err)
+				}
+				cancel()
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+// pruneResidualCredentials removes plaintext credential directories a previous
+// run left behind (kill -9, power loss, or a crash before the deferred wipe).
+//
+// Only `.claude` and its `.incoming` staging sibling are cleared; a desktop
+// profile keeps its `browser_data` because that is meant to persist. A
+// credential file touched within `heartbeatEvery` is treated as a session
+// running in another terminal and left alone, so starting one account does not
+// pull the config dir out from under a concurrent one.
+func pruneResidualCredentials(root string) {
+	profilesDir := filepath.Join(root, "profiles")
+	entries, err := os.ReadDir(profilesDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(profilesDir, entry.Name())
+		configDir := filepath.Join(dir, ".claude")
+		if stamp, err := os.Stat(filepath.Join(configDir, ".credentials.json")); err == nil &&
+			time.Since(stamp.ModTime()) < heartbeatEvery {
+			continue
+		}
+		_ = os.RemoveAll(configDir)
+		_ = os.RemoveAll(configDir + ".incoming")
+		if rest, err := os.ReadDir(dir); err == nil && len(rest) == 0 {
+			_ = os.Remove(dir)
+		}
+	}
 }
 
 // refreshCredentials downloads and unpacks the encrypted credential archive
@@ -1359,7 +1437,9 @@ func usage() {
   claude-box cli     --key <CARD_KEY> --secret <TUNNEL_SECRET> --host <URL> [-- <claude args>]
   claude-box desktop --key <CARD_KEY> --secret <TUNNEL_SECRET> --host <URL> [--runtime <dir>]
 
-Both modes verify the egress IP before handing over to the client.
+Both modes verify the egress IP before handing over to the client. The decrypted
+Claude credential directory is always erased on exit; the next start clears any
+copy a killed run left behind.
 
 Environment:
   CCE_HOST          default for --host

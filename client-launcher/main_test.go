@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -613,12 +614,12 @@ func TestReadHeadRequiresConnect(t *testing.T) {
 func TestClaudeArgsAreSeparatedFromLauncherFlags(t *testing.T) {
 	takesValue := func(name string) bool {
 		switch name {
-		case "key", "host", "gateway", "claude", "runtime":
+		case "key", "secret", "host", "gateway", "claude", "runtime":
 			return true
 		}
 		return false
 	}
-	known := func(name string) bool { return takesValue(name) || name == "keep" || name == "v" }
+	known := func(name string) bool { return takesValue(name) || name == "v" }
 
 	cases := []struct {
 		in       []string
@@ -637,9 +638,9 @@ func TestClaudeArgsAreSeparatedFromLauncherFlags(t *testing.T) {
 			wantRest: []string{"--key", "child"},
 		},
 		{
+			// --keep was removed, so it is no longer ours and must reach claude.
 			in:       []string{"--keep"},
-			wantOwn:  []string{"--keep"},
-			wantRest: nil,
+			wantRest: []string{"--keep"},
 		},
 	}
 
@@ -651,6 +652,127 @@ func TestClaudeArgsAreSeparatedFromLauncherFlags(t *testing.T) {
 		if strings.Join(rest, "\x00") != strings.Join(testCase.wantRest, "\x00") {
 			t.Fatalf("%q: rest = %q, want %q", testCase.in, rest, testCase.wantRest)
 		}
+	}
+}
+
+// TestPruneResidualCredentials clears plaintext stores a killed run left behind
+// while leaving both the persistent desktop data and a concurrently running
+// session's fresh store alone.
+func TestPruneResidualCredentials(t *testing.T) {
+	defer func(previous time.Duration) { heartbeatEvery = previous }(heartbeatEvery)
+	heartbeatEvery = time.Minute
+
+	root := t.TempDir()
+	dirty := filepath.Join(root, "profiles", "acct-1")
+	for _, path := range []string{
+		filepath.Join(dirty, ".claude", ".credentials.json"),
+		filepath.Join(dirty, ".claude.incoming", ".claude", ".credentials.json"),
+		filepath.Join(dirty, "browser_data", "prefs.js"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Its credential stamp is old, so the whole store is residue.
+	old := time.Now().Add(-10 * heartbeatEvery)
+	if err := os.Chtimes(filepath.Join(dirty, ".claude", ".credentials.json"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	// A profile directory holding nothing but credentials should disappear too.
+	empty := filepath.Join(root, "profiles", "acct-2", ".claude")
+	if err := os.MkdirAll(empty, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(empty, ".credentials.json"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(empty, ".credentials.json"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	// A second terminal's session stamped just now must survive this one's start.
+	live := filepath.Join(root, "profiles", "acct-3", ".claude")
+	if err := os.MkdirAll(live, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(live, ".credentials.json"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneResidualCredentials(root)
+
+	for _, gone := range []string{
+		filepath.Join(dirty, ".claude"),
+		filepath.Join(dirty, ".claude.incoming"),
+		filepath.Join(root, "profiles", "acct-2"),
+	} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s should be gone", gone)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dirty, "browser_data", "prefs.js")); err != nil {
+		t.Errorf("browser_data should have survived: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(live, ".credentials.json")); err != nil {
+		t.Errorf("a fresh concurrent session should have survived: %v", err)
+	}
+	// An absent profiles root is not an error.
+	pruneResidualCredentials(filepath.Join(root, "nowhere"))
+}
+
+// TestKeepAliveBeatsUntilStopped proves the lease is held for the whole session
+// instead of only at startup.
+func TestKeepAliveBeatsUntilStopped(t *testing.T) {
+	defer func(previous time.Duration) { heartbeatEvery = previous }(heartbeatEvery)
+	heartbeatEvery = 5 * time.Millisecond
+
+	var mu sync.Mutex
+	beats := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/launcher/heartbeat" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		mu.Lock()
+		beats++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := &apiClient{base: server.URL, key: "k", secret: "s", sessionID: "sid",
+		http: &http.Client{Timeout: 5 * time.Second}}
+	stop := keepAlive(context.Background(), client)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		seen := beats
+		mu.Unlock()
+		if seen >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d heartbeats", seen)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	stop()
+	// A tick can already be in flight or win the select once against the closed
+	// channel; let that settle, then no further beat may land.
+	time.Sleep(3 * heartbeatEvery)
+	mu.Lock()
+	before := beats
+	mu.Unlock()
+	time.Sleep(10 * heartbeatEvery)
+	mu.Lock()
+	after := beats
+	mu.Unlock()
+	if after != before {
+		t.Errorf("still beating after stop: %d -> %d", before, after)
 	}
 }
 
