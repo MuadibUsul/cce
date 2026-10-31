@@ -1,0 +1,8 @@
+dist/
+.venv/
+__pycache__/
+*.pyc
+data/
+*.egg-info/
+gateway/gateway
+client-launcher/client-launcher

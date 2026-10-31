@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-cluster-engine-server"
+version = "0.1.0"
+description = "Antidetect profile manager, static proxy mesh and Claude delivery control plane."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "aiosqlite>=0.20",
+  "httpx[socks]>=0.27",
+  "camoufox[async]>=0.4.11",
+  "browserforge>=1.2",
+  "cryptography>=43",
+  "fastmcp>=2.0",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "respx>=0.21"]
+
+[tool.setuptools]
+packages = ["db", "core", "api"]
+py-modules = ["mcp_server"]
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["../tests"]
+markers = ["network: requires outbound internet"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
