@@ -15,7 +15,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -183,42 +182,35 @@ func parseSNI(body []byte) (string, error) {
 
 // secrets authorises tunnel clients.
 //
-// Every card key carries its own random tunnel secret, so a single static value
-// cannot cover a fleet. The gateway keeps a set: `CCE_TUNNEL_SECRET` for
-// single-machine runs, plus an optional file the control plane exports, which is
-// re-read whenever its mtime changes so a revocation lands without a restart.
+// The control plane exports one grant per card key. Each grant binds a secret
+// to a profile port and expiry, and the file is re-read when it changes.
 type secrets struct {
-	fixed string
 	path  string
 	mu    sync.Mutex
 	seen  time.Time
-	extra map[string]struct{}
+	extra map[string]secretGrant
 }
 
-func newSecrets(fixed, path string) *secrets {
-	return &secrets{fixed: fixed, path: path}
+type secretGrant struct {
+	port    int
+	expires time.Time
 }
 
-func (s *secrets) has(secret string) bool {
-	if secret == "" {
+func newSecrets(path string) *secrets {
+	return &secrets{path: path}
+}
+
+func (s *secrets) authorizes(secret, profile string) bool {
+	port, err := strconv.Atoi(profile)
+	if secret == "" || err != nil || port <= 0 {
 		return false
 	}
-	if s.fixed != "" && subtle.ConstantTimeCompare([]byte(secret), []byte(s.fixed)) == 1 {
-		return true
-	}
-	if s.path == "" {
-		return false
-	}
-	for candidate := range s.load() {
-		if subtle.ConstantTimeCompare([]byte(secret), []byte(candidate)) == 1 {
-			return true
-		}
-	}
-	return false
+	grant, ok := s.load()[secret]
+	return ok && port == grant.port && time.Now().Before(grant.expires)
 }
 
-// load refreshes the exported set, one `card_key secret expires_at` per line.
-func (s *secrets) load() map[string]struct{} {
+// load refreshes the exported set, one `card_key secret expires_at profile_port` per line.
+func (s *secrets) load() map[string]secretGrant {
 	info, err := os.Stat(s.path)
 	if err != nil {
 		return nil
@@ -230,27 +222,29 @@ func (s *secrets) load() map[string]struct{} {
 	}
 	data, err := os.ReadFile(s.path)
 	if err != nil {
-		return s.extra
+		return nil
 	}
-	next := make(map[string]struct{})
-	now := time.Now()
+	next := make(map[string]secretGrant)
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") {
+		if len(fields) != 4 || strings.HasPrefix(fields[0], "#") {
 			continue
 		}
-		if len(fields) > 2 {
-			if expires, err := time.Parse(time.RFC3339, fields[2]); err == nil && expires.Before(now) {
-				continue
-			}
+		expires, err := time.Parse(time.RFC3339, fields[2])
+		if err != nil {
+			continue
 		}
-		next[fields[1]] = struct{}{}
+		port, err := strconv.Atoi(fields[3])
+		if err != nil || port <= 0 {
+			continue
+		}
+		next[fields[1]] = secretGrant{port: port, expires: expires}
 	}
 	s.seen, s.extra = info.ModTime(), next
 	return next
 }
 
-func (s *secrets) enabled() bool { return s.fixed != "" || s.path != "" }
+func (s *secrets) enabled() bool { return s.path != "" }
 
 type gateway struct {
 	domains *whitelist
@@ -283,22 +277,14 @@ func (g *gateway) handle(conn net.Conn) {
 
 	if head[0] == 0x16 {
 		g.handleTLS(conn, reader)
-		return
 	}
-	g.handleConnect(conn, reader)
 }
 
 // handleTLS accepts a TLS client.
 //
-// Two shapes end up here, distinguished by SNI:
-//
-//   - The client dialled a whitelisted origin directly (SNI is that origin).
-//     The ClientHello is replayed and spliced to the origin: the TLS session runs
-//     end to end, so certificate pinning inside Claude still works.
-//   - The client dialled the gateway itself. There is either no SNI (an IP
-//     address was given) or a non-whitelisted one, so the handshake is terminated
-//     here and the tunnel is served inside, where the CONNECT target is checked
-//     against the whitelist instead.
+// A raw ClientHello for an origin cannot carry the delivery credentials or a
+// profile port, so it is refused. Launcher TLS is terminated here, then the
+// authenticated CONNECT target is checked before any origin dial.
 func (g *gateway) handleTLS(conn net.Conn, reader *bufio.Reader) {
 	sni, record, err := peekClientHello(reader)
 	if err != nil && !errors.Is(err, errNoSNI) {
@@ -311,17 +297,9 @@ func (g *gateway) handleTLS(conn net.Conn, reader *bufio.Reader) {
 	// Everything consumed from `reader` goes back in front of the live socket.
 	replay := &handshakeConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(record), reader, conn)}
 
+	// Raw TLS carries no card credential or profile port. Only the authenticated
+	// CONNECT protocol may reach an origin.
 	if sni != "" && g.domains.allows(sni) {
-		upstream, err := tls.Dial("tcp", net.JoinHostPort(sni, "443"), &tls.Config{ServerName: sni})
-		if err != nil {
-			if g.debug {
-				log.Printf("tls dial %s: %v", sni, err)
-			}
-			return
-		}
-		defer upstream.Close()
-		_ = conn.SetDeadline(time.Time{})
-		splice(replay, upstream)
 		return
 	}
 
@@ -353,7 +331,7 @@ func (g *gateway) handleConnect(conn net.Conn, reader *bufio.Reader) {
 		fmt.Fprint(conn, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
-	if g.secrets.enabled() && !g.secrets.has(request.bearer) {
+	if !g.secrets.authorizes(request.bearer, request.profile) {
 		fmt.Fprint(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
@@ -377,7 +355,25 @@ func (g *gateway) handleConnect(conn net.Conn, reader *bufio.Reader) {
 
 	fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 	_ = conn.SetDeadline(time.Time{})
+	finished := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-finished:
+				return
+			case <-ticker.C:
+				if !g.secrets.authorizes(request.bearer, request.profile) {
+					conn.Close()
+					upstream.Close()
+					return
+				}
+			}
+		}
+	}()
 	splice(&handshakeConn{Conn: conn, reader: reader}, upstream)
+	close(finished)
 }
 
 type requestHead struct {
@@ -433,16 +429,9 @@ func readRequestHead(reader *bufio.Reader) (requestHead, error) {
 
 // dialOrigin opens the connection to the requested host.
 //
-// The traffic has to leave from the profile's residential IP, so the dial goes
-// through that profile's sing-box inbound (a "mixed" listener, which answers
-// CONNECT) rather than from the gateway's own address. Without the header the
-// gateway falls back to a direct dial, which is right for a single-machine run
-// but reported by the launcher's kill switch as an IP mismatch -- exactly the
-// signal that the chain is missing.
+// The traffic leaves through the profile's sing-box inbound. A missing or
+// invalid port is rejected so the gateway never falls back to its own IP.
 func (g *gateway) dialOrigin(request requestHead) (net.Conn, error) {
-	if request.profile == "" || strings.HasPrefix(request.profile, "0") {
-		return net.DialTimeout("tcp", net.JoinHostPort(request.host, request.port), dialTimeout)
-	}
 	port, err := strconv.Atoi(request.profile)
 	low, high := g.profileRange()
 	if err != nil || port < low || port > high {
@@ -564,8 +553,10 @@ func main() {
 	if *domainsFlag != "" {
 		domains = strings.Split(*domainsFlag, ",")
 	}
-	tunnelSecrets := newSecrets(os.Getenv("CCE_TUNNEL_SECRET"),
-		envOr("CCE_TUNNEL_SECRETS", ""))
+	tunnelSecrets := newSecrets(os.Getenv("CCE_TUNNEL_SECRETS"))
+	if !tunnelSecrets.enabled() {
+		log.Fatal("configure CCE_TUNNEL_SECRETS")
+	}
 
 	certificate, err := loadCertificate(*certPath, *keyPath)
 	if err != nil {

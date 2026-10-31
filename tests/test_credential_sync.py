@@ -15,7 +15,6 @@ import tarfile
 from pathlib import Path
 
 import pytest
-
 from core.browser_pool import BrowserPool, BrowserPoolError, _extract_url
 from core.crypto import decrypt_blob
 from db.database import Database
@@ -80,6 +79,7 @@ async def pool(db: Database, profiles: object) -> FakePool:
     yield instance
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fake Claude executable is a POSIX shell script")
 async def test_credentials_are_sealed_under_the_profile(db: Database, profiles: object, pool: FakePool,
                                                         tmp_path: Path) -> None:
     record = await profiles.create_profile(  # type: ignore[attr-defined]
@@ -91,7 +91,7 @@ async def test_credentials_are_sealed_under_the_profile(db: Database, profiles: 
 
     # The fake prints the URL, then writes the credential file while still alive
     # -- the real CLI keeps waiting for a pasted code at this point.
-    claude = fake_claude(
+    fake_claude(
         tmp_path,
         'echo "Opening browser to sign in…"\n'
         'echo "visit: https://claude.com/cai/oauth/authorize?code=true&state=xyz"\n'
@@ -112,6 +112,7 @@ async def test_credentials_are_sealed_under_the_profile(db: Database, profiles: 
     assert stored and stored["claude_credentials_enc"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fake Claude executable is a POSIX shell script")
 async def test_a_login_that_never_prints_a_url_still_completes(
     db: Database, profiles: object, pool: FakePool, tmp_path: Path
 ) -> None:
@@ -121,7 +122,7 @@ async def test_a_login_that_never_prints_a_url_still_completes(
         expected_ip="203.0.113.5", os_type="linux",
     )
     home = profiles.claude_home_dir("acct-quiet")  # type: ignore[attr-defined]
-    claude = fake_claude(
+    fake_claude(
         tmp_path,
         f'mkdir -p "{home}/.claude" && echo \'{{"accessToken":"t"}}\' > "{home}/.claude/.credentials.json"\n'
         "exec sleep 30\n",
@@ -137,6 +138,7 @@ async def test_a_login_that_never_prints_a_url_still_completes(
     assert ".claude/.credentials.json" in archive_names(decrypt_blob(blob, associated=b"acct-quiet"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fake Claude executable is a POSIX shell script")
 async def test_an_early_exit_reports_the_output(db: Database, profiles: object, pool: FakePool,
                                                 tmp_path: Path) -> None:
     await profiles.create_profile(  # type: ignore[attr-defined]

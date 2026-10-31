@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
-
+from conftest import seed_file
 from core.profile_manager import (
     PORT_RANGE,
     ProfileError,
@@ -13,7 +13,6 @@ from core.profile_manager import (
     noise_seed_for,
 )
 from db.database import Database
-from conftest import seed_file
 
 
 def test_noise_seed_is_deterministic_and_32_bit() -> None:
@@ -162,12 +161,12 @@ async def test_drawn_identity_passes_camoufox_coherence(profiles: ProfileManager
 async def test_ua_version_matches_installed_kernel(profiles: ProfileManager) -> None:
     """The UA must advertise the version that actually runs, or the mismatch is
     visible to any script comparing `navigator.userAgent` with the JS engine."""
-    from camoufox.pkgman import installed_verstr
+    from core import profile_manager
 
     row = await profiles.create_profile("acct-ua", os_type="macos")
     user_agent = json.loads(row["fingerprint_json"])["user_agent"]
 
-    major = installed_verstr().split(".")[0]
+    major = profile_manager.installed_verstr().split(".")[0]
     assert f"rv:{major}." in user_agent
     assert f"Firefox/{major}." in user_agent
 

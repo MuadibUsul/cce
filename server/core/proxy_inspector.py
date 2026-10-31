@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from core.secret_export import export_secrets
 from db.database import Database
 
 GEO_ENDPOINT = "http://ip-api.com/json/?fields=status,message,countryCode,regionName,city,lat,lon,timezone,query"
@@ -152,6 +153,7 @@ class ProxyInspector:
         except ProxyKillSwitchError as exc:
             exc.profile_id = profile_id
             await self._db.set_status(profile_id, "PROXY_DEAD")
+            await export_secrets(self._db)
             raise
 
         await self._db.save_geo(profile_id, _json_dumps(geo.to_json()))

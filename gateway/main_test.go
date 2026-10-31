@@ -141,7 +141,7 @@ func TestPeekClientHelloRejectsPlaintext(t *testing.T) {
 // checked instead.
 func TestGatewayTerminatesWhenClientDialsTheGateway(t *testing.T) {
 	certificate := testCertificate(t)
-	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com", "127.0.0.1"}), certificate: &certificate}
+	g := &gateway{secrets: testSecrets(t, "s3cret", 10432), domains: newWhitelist([]string{"*.anthropic.com", "127.0.0.1"}), certificate: &certificate}
 
 	origin, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -166,20 +166,13 @@ func TestGatewayTerminatesWhenClientDialsTheGateway(t *testing.T) {
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	_, originPort, _ := net.SplitHostPort(origin.Addr().String())
-	fmt.Fprintf(conn, "CONNECT 127.0.0.1:%s HTTP/1.1\r\n\r\n", originPort)
+	fmt.Fprintf(conn, "CONNECT 127.0.0.1:%s HTTP/1.1\r\nProxy-Authorization: Bearer s3cret\r\nx-profile-port: 10432\r\n\r\n", originPort)
 	response, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !strings.Contains(response, "200") {
-		t.Fatalf("response = %q", response)
-	}
-	body := make([]byte, len("origin"))
-	if _, err := io.ReadFull(conn, body); err != nil {
-		t.Fatalf("read origin: %v", err)
-	}
-	if string(body) != "origin" {
-		t.Fatalf("body = %q", body)
+	if !strings.Contains(response, "502") {
+		t.Fatalf("missing relay must be refused, got %q", response)
 	}
 }
 
@@ -226,6 +219,16 @@ func testCertificate(t *testing.T) tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
+func testSecrets(t *testing.T, secret string, port int) *secrets {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "secrets")
+	line := fmt.Sprintf("cce-test %s 2099-01-01T00:00:00Z %d\n", secret, port)
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return newSecrets(path)
+}
+
 func TestParseSNIRejectsTruncated(t *testing.T) {
 	if _, err := parseSNI([]byte{0x03, 0x03}); err == nil {
 		t.Fatal("expected an error for a short handshake")
@@ -248,8 +251,9 @@ func TestReadRequestHeadParsesConnectAndBearer(t *testing.T) {
 	}
 }
 
-// TestConnectTunnelEndToEnd dials a local echo server through the gateway.
-func TestConnectTunnelEndToEnd(t *testing.T) {
+// A missing relay must not fall back to a direct connection from the gateway.
+func TestConnectDoesNotFallBackToDirectOrigin(t *testing.T) {
+	certificate := testCertificate(t)
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -273,7 +277,7 @@ func TestConnectTunnelEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer front.Close()
-	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"127.0.0.1"})}
+	g := &gateway{secrets: testSecrets(t, "s3cret", 10432), domains: newWhitelist([]string{"127.0.0.1"}), certificate: &certificate}
 	go func() {
 		for {
 			conn, err := front.Accept()
@@ -284,7 +288,7 @@ func TestConnectTunnelEndToEnd(t *testing.T) {
 		}
 	}()
 
-	conn, err := net.Dial("tcp", front.Addr().String())
+	conn, err := tls.Dial("tcp", front.Addr().String(), &tls.Config{InsecureSkipVerify: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +297,7 @@ func TestConnectTunnelEndToEnd(t *testing.T) {
 
 	target := echo.Addr().(*net.TCPAddr)
 	// The gateway always dials 443 for CONNECT unless a port is given.
-	if _, err := conn.Write([]byte("CONNECT " + net.JoinHostPort(target.IP.String(), itoa(target.Port)) + " HTTP/1.1\r\n\r\n")); err != nil {
+	if _, err := conn.Write([]byte("CONNECT " + net.JoinHostPort(target.IP.String(), itoa(target.Port)) + " HTTP/1.1\r\nProxy-Authorization: Bearer s3cret\r\nx-profile-port: 10432\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
 	reader := bufio.NewReader(conn)
@@ -301,21 +305,8 @@ func TestConnectTunnelEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(line, "200") {
-		t.Fatalf("expected 200, got %q", line)
-	}
-	for {
-		line, err = reader.ReadString('\n')
-		if err != nil || strings.TrimSpace(line) == "" {
-			break
-		}
-	}
-	body := make([]byte, 4)
-	if _, err := io.ReadFull(reader, body); err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "pong" {
-		t.Fatalf("got %q, want pong", body)
+	if !strings.Contains(line, "502") {
+		t.Fatalf("expected 502 without relay, got %q", line)
 	}
 }
 
@@ -327,42 +318,95 @@ func TestSecretsAuthorisesExportedKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	set := newSecrets("", path)
+	set := newSecrets(path)
 
-	write("# card_key secret expires_at\ncce-a aaa 2099-01-01T00:00:00Z\n")
-	if !set.has("aaa") {
+	write("# card_key secret expires_at profile_port\ncce-a aaa 2099-01-01T00:00:00Z 10432\n")
+	if !set.authorizes("aaa", "10432") {
 		t.Fatal("exported secret should authorise")
 	}
-	if set.has("bbb") || set.has("") {
+	if set.authorizes("aaa", "10433") || set.authorizes("aaa", "") || set.authorizes("bbb", "10432") {
 		t.Fatal("unknown or empty secret should not authorise")
 	}
 
 	// A revocation rewrites the file; the change has to land without a restart.
-	write("cce-b bbb 2099-01-01T00:00:00Z\n")
-	if set.has("aaa") {
+	write("cce-b bbb 2099-01-01T00:00:00Z 10433\n")
+	if set.authorizes("aaa", "10432") {
 		t.Error("removed secret still authorises")
 	}
-	if !set.has("bbb") {
+	if !set.authorizes("bbb", "10433") {
 		t.Error("freshly exported secret rejected")
 	}
 
-	write("cce-old ccc 2000-01-01T00:00:00Z\n")
-	if set.has("ccc") {
+	write("cce-old ccc 2000-01-01T00:00:00Z 10432\n")
+	if set.authorizes("ccc", "10432") {
 		t.Error("expired secret should not authorise")
 	}
 }
 
-func TestStaticSecretAlsoWorks(t *testing.T) {
-	set := newSecrets("s3cret", "")
-	if !set.has("s3cret") || set.has("other") {
-		t.Fatal("static comparison is wrong")
+func TestGatewayRequiresSecretFile(t *testing.T) {
+	if newSecrets("").enabled() {
+		t.Fatal("gateway must refuse startup without a secret file")
 	}
-	if set.enabled() != true {
-		t.Fatal("configured gateway must demand a secret")
+}
+
+func TestCachedGrantExpiresWithoutFileChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secrets")
+	expires := time.Now().Add(1500 * time.Millisecond).UTC().Format(time.RFC3339Nano)
+	if err := os.WriteFile(path, []byte("cce-a aaa "+expires+" 10432\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	// No secret configured at all means an open tunnel, which local dev needs.
-	if newSecrets("", "").enabled() {
-		t.Fatal("empty gateway should not demand a secret")
+	set := newSecrets(path)
+	if !set.authorizes("aaa", "10432") {
+		t.Fatal("grant should initially be live")
+	}
+	time.Sleep(1600 * time.Millisecond)
+	if set.authorizes("aaa", "10432") {
+		t.Fatal("cached expired grant must not remain live")
+	}
+}
+
+func TestConnectSecretCannotSelectAnotherProfile(t *testing.T) {
+	certificate := testCertificate(t)
+	g := &gateway{secrets: testSecrets(t, "s3cret", 10432), domains: newWhitelist([]string{"127.0.0.1"}), certificate: &certificate}
+	front := startFront(t, g)
+	for _, profile := range []string{"", "10433"} {
+		conn, err := tls.Dial("tcp", front, &tls.Config{InsecureSkipVerify: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		fmt.Fprintf(conn, "CONNECT 127.0.0.1:443 HTTP/1.1\r\nProxy-Authorization: Bearer s3cret\r\nx-profile-port: %s\r\n\r\n", profile)
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		conn.Close()
+		if err != nil || !strings.Contains(line, "407") {
+			t.Fatalf("profile %q: got %q, %v; want 407", profile, line, err)
+		}
+	}
+}
+
+func TestPlaintextConnectIsRefused(t *testing.T) {
+	certificate := testCertificate(t)
+	g := &gateway{secrets: testSecrets(t, "s3cret", 10432), domains: newWhitelist([]string{"127.0.0.1"}), certificate: &certificate}
+	conn, err := net.Dial("tcp", startFront(t, g))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprint(conn, "CONNECT 127.0.0.1:443 HTTP/1.1\r\nProxy-Authorization: Bearer s3cret\r\nx-profile-port: 10432\r\n\r\n")
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
+		t.Fatal("plaintext CONNECT must not receive a proxy response")
+	}
+}
+
+func TestRawTLSCannotBypassConnectAuthentication(t *testing.T) {
+	certificate := testCertificate(t)
+	g := &gateway{secrets: testSecrets(t, "s3cret", 10432), domains: newWhitelist([]string{"localhost"}), certificate: &certificate}
+	front := startFront(t, g)
+	conn, err := tls.Dial("tcp", front, &tls.Config{ServerName: "localhost", InsecureSkipVerify: true})
+	if err == nil {
+		conn.Close()
+		t.Fatal("raw TLS to an origin name must be rejected")
 	}
 }
 
@@ -387,7 +431,7 @@ func TestBlockedDomainClosesConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer front.Close()
-	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com"})}
+	g := &gateway{secrets: newSecrets(""), domains: newWhitelist([]string{"*.anthropic.com"})}
 	go func() {
 		for {
 			conn, err := front.Accept()
@@ -467,7 +511,7 @@ func TestDialOriginGoesThroughRelay(t *testing.T) {
 		io.WriteString(conn, "relayed")
 	}()
 
-	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com"}), minPort: 1, maxPort: 65535}
+	g := &gateway{secrets: newSecrets(""), domains: newWhitelist([]string{"*.anthropic.com"}), minPort: 1, maxPort: 65535}
 
 	conn, err := g.dialOrigin(requestHead{host: "api.anthropic.com", port: "443", profile: relayPort})
 	if err != nil {
@@ -493,7 +537,7 @@ func TestDialOriginGoesThroughRelay(t *testing.T) {
 	}
 }
 
-func TestDialOriginFallsBackWithoutProfilePort(t *testing.T) {
+func TestDialOriginRejectsMissingProfilePort(t *testing.T) {
 	origin, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -508,16 +552,16 @@ func TestDialOriginFallsBackWithoutProfilePort(t *testing.T) {
 		conn.Close()
 	}()
 
-	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com"})}
+	g := &gateway{secrets: newSecrets(""), domains: newWhitelist([]string{"*.anthropic.com"})}
 	conn, err := g.dialOrigin(requestHead{host: host, port: port})
-	if err != nil {
-		t.Fatalf("dialOrigin: %v", err)
+	if err == nil {
+		conn.Close()
+		t.Fatal("missing profile port must be rejected")
 	}
-	conn.Close()
 }
 
 func TestDialOriginRejectsOutOfRangePort(t *testing.T) {
-	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com"})}
+	g := &gateway{secrets: newSecrets(""), domains: newWhitelist([]string{"*.anthropic.com"})}
 	for _, port := range []string{"80", "12000", "not-a-port"} {
 		if _, err := g.dialOrigin(requestHead{host: "127.0.0.1", port: "1", profile: port}); err == nil {
 			t.Errorf("profile port %q should be refused", port)

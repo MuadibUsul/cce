@@ -61,6 +61,7 @@ def main() -> int:
     wait_port(relay_port)
 
     control = serve(Control(control_port, {
+        "session_id": "e2e-session",
         "profile_id": PROFILE,
         "expected_ip": EXIT_IP,
         "local_proxy_port": relay_port,
@@ -85,9 +86,13 @@ def main() -> int:
         "tunnel": {"host": "127.0.0.1", "port": gateway_port, "secret": "s3cret"},
     }))
 
+    secrets_path = os.path.join(os.path.dirname(chain), "e2e-secrets")
+    with open(secrets_path, "w") as out:
+        out.write(f"test_001 s3cret 2099-01-01T00:00:00Z {relay_port}\n")
+
     gateway = subprocess.Popen(
         [build("gateway", "gateway"), "--listen", f"127.0.0.1:{gateway_port}", "--debug"],
-        env=dict(os.environ, CCE_TUNNEL_SECRET="s3cret", CCE_TUNNEL_CERT=chain, CCE_TUNNEL_KEY=key),
+        env=dict(os.environ, CCE_TUNNEL_SECRETS=secrets_path, CCE_TUNNEL_CERT=chain, CCE_TUNNEL_KEY=key),
     )
     wait_port(gateway_port)
 
@@ -95,7 +100,7 @@ def main() -> int:
     nss_import(os.path.join(profile_root, "browser_data"), ca)
     try:
         launcher = subprocess.Popen(
-            [build("claude-box", "client-launcher"), "desktop", "--key", "test_001",
+            [build("claude-box", "client-launcher"), "desktop", "--key", "test_001", "--secret", "s3cret",
              "--host", f"http://127.0.0.1:{control_port}", "--runtime", RUNTIME, "-v"],
             env=dict(os.environ, CCE_TUNNEL_CA=ca, SSL_CERT_FILE=ca, CCE_HEADLESS="1"),
             stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True,

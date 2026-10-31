@@ -6,9 +6,8 @@
 //
 // Contract with the rest of the system:
 //
-//   - `/launcher/session` returns the profile's expected egress IP, geo, a
-//     one-time tunnel secret and the gateway address. Both factors are required,
-//     so a leaked URL alone is useless.
+//   - `/launcher/session` requires the card key and tunnel secret, and returns
+//     the profile's expected egress IP, geo and gateway address.
 //   - The launcher opens a loopback CONNECT proxy. Everything the CLI sends is
 //     relayed through the gateway, which enforces the domain whitelist, and from
 //     there to the profile's sing-box port and its static residential upstream.
@@ -82,6 +81,7 @@ var kernelURLDefault = ""
 
 // session is the subset of /launcher/session the launcher acts on.
 type session struct {
+	SessionID     string          `json:"session_id"`
 	ProfileID     string          `json:"profile_id"`
 	PlanTier      string          `json:"plan_tier"`
 	OSType        string          `json:"os_type"`
@@ -159,6 +159,7 @@ func main() {
 	set := flag.NewFlagSet(mode, flag.ContinueOnError)
 	set.SetOutput(io.Discard)
 	key := set.String("key", "", "delivery card key from the order email")
+	secret := set.String("secret", envOr("CCE_TUNNEL_SECRET", ""), "delivery tunnel secret")
 	host := set.String("host", envOr("CCE_HOST", ""), "control plane base URL")
 	gateway := set.String("gateway", envOr("CCE_GATEWAY", ""), "gateway host:port override")
 	claudeBin := set.String("claude", "claude", "path to the claude binary")
@@ -167,7 +168,7 @@ func main() {
 	verbose := set.Bool("v", false, "verbose")
 	own, claudeArgs := splitArgs(os.Args[2:], func(name string) bool {
 		switch name {
-		case "key", "host", "gateway", "claude", "runtime":
+		case "key", "secret", "host", "gateway", "claude", "runtime":
 			return true // takes a value
 		case "keep", "v":
 			return false
@@ -175,7 +176,7 @@ func main() {
 		return false
 	}, func(name string) bool {
 		switch name {
-		case "key", "host", "gateway", "claude", "runtime", "keep", "v":
+		case "key", "secret", "host", "gateway", "claude", "runtime", "keep", "v":
 			return true
 		}
 		return false
@@ -186,6 +187,9 @@ func main() {
 
 	if *key == "" {
 		fail("missing --key")
+	}
+	if *secret == "" {
+		fail("missing --secret (or CCE_TUNNEL_SECRET)")
 	}
 	if *host == "" {
 		fail("missing --host (or CCE_HOST)")
@@ -203,40 +207,38 @@ func main() {
 	if err != nil {
 		fail("%v", err)
 	}
+	client.secret = *secret
 
 	// Kill switch first: everything below assumes the account's IP is live.
 	sess, err := client.session(ctx)
 	if err != nil {
 		fail("%v", err)
 	}
-	// Status reports are authenticated with both factors, so the client needs
-	// the secret as soon as the session exists.
-	client.secret = sess.Tunnel.Secret
 	if *gateway != "" {
 		host, port, splitErr := net.SplitHostPort(*gateway)
 		if splitErr != nil {
-			fail("--gateway must be host:port: %v", splitErr)
+			abortSession(client, ctx, statusIdle, "--gateway must be host:port: %v", splitErr)
 		}
 		parsed, convErr := strconv.Atoi(port)
 		if convErr != nil {
-			fail("--gateway port is not a number: %v", convErr)
+			abortSession(client, ctx, statusIdle, "--gateway port is not a number: %v", convErr)
 		}
 		sess.Tunnel.Host, sess.Tunnel.Port = host, parsed
 	}
 
 	root, err := stateRoot()
 	if err != nil {
-		fail("%v", err)
+		abortSession(client, ctx, statusIdle, "%v", err)
 	}
 	proxy, err := startLoopbackProxy(sess, *verbose)
 	if err != nil {
-		fail("%v", err)
+		abortSession(client, ctx, statusIdle, "%v", err)
 	}
 	defer proxy.Close()
 
 	observed, err := proxy.probe(ctx)
 	if err != nil {
-		fail("kill switch: %v", err)
+		abortSession(client, ctx, "PROXY_DEAD", "kill switch: %v", err)
 	}
 	if sess.ExpectedIP != "" && observed != sess.ExpectedIP {
 		_ = client.heartbeat(ctx, observed)
@@ -250,19 +252,25 @@ func main() {
 		err = runCLI(ctx, client, sess, root, proxy, *claudeBin, *keep, claudeArgs)
 	case "desktop":
 		err = runDesktop(ctx, sess, root, proxy, *runtimeDir)
+		client.report(ctx, outcome{status: statusIdle})
 	}
 	if err != nil {
 		fail("%v", err)
 	}
 }
 
+func abortSession(client *apiClient, ctx context.Context, state, format string, args ...any) {
+	client.report(ctx, outcome{status: state})
+	fail(format, args...)
+}
+
 // -- control plane ---------------------------------------------------------
 
 type apiClient struct {
-	base string
-	key  string
-	// secret is the tunnel secret echoed on status reports; it is issued by
-	// /launcher/session, so it is filled in once a session exists.
+	base      string
+	key       string
+	sessionID string
+	// secret is provisioned alongside the card key and required on every route.
 	secret string
 	http   *http.Client
 }
@@ -275,6 +283,12 @@ func newAPIClient(host, key string) (*apiClient, error) {
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return nil, errors.New("--host must be an http(s) URL")
+	}
+	if parsed.Scheme == "http" {
+		ip := net.ParseIP(parsed.Hostname())
+		if !strings.EqualFold(parsed.Hostname(), "localhost") && (ip == nil || !ip.IsLoopback()) {
+			return nil, errors.New("--host must use HTTPS outside loopback")
+		}
 	}
 	// The control plane is reached directly: the tunnel is not up yet, and a
 	// broken tunnel must not hide the reason we cannot start one.
@@ -292,14 +306,15 @@ func (c *apiClient) do(ctx context.Context, method, path, secret string) (*http.
 	if secret != "" {
 		request.Header.Set("x-tunnel-secret", secret)
 	}
+	if c.sessionID != "" {
+		request.Header.Set("x-session-id", c.sessionID)
+	}
 	return c.http.Do(request)
 }
 
 func (c *apiClient) session(ctx context.Context) (*session, error) {
-	// The session endpoint needs both factors; the secret is issued by the
-	// server on first use and echoed by /launcher/session itself, so the first
-	// call reads it from the key record. The server returns it in the body.
-	resp, err := c.do(ctx, http.MethodPost, "/launcher/session", "")
+	// Both delivery credentials are required before a profile is reserved.
+	resp, err := c.do(ctx, http.MethodPost, "/launcher/session", c.secret)
 	if err != nil {
 		return nil, fmt.Errorf("contacting control plane: %w", err)
 	}
@@ -312,9 +327,11 @@ func (c *apiClient) session(ctx context.Context) (*session, error) {
 	if err := json.Unmarshal(body, &sess); err != nil {
 		return nil, fmt.Errorf("malformed session payload: %w", err)
 	}
-	if sess.ProfileID == "" || sess.Tunnel.Host == "" || sess.Tunnel.Secret == "" {
+	if sess.ProfileID == "" || sess.SessionID == "" || sess.Tunnel.Host == "" {
 		return nil, errors.New("session payload incomplete")
 	}
+	sess.Tunnel.Secret = c.secret
+	c.sessionID = sess.SessionID
 	return &sess, nil
 }
 
@@ -337,6 +354,8 @@ func (c *apiClient) heartbeat(ctx context.Context, observed string) error {
 		return err
 	}
 	request.Header.Set("authorization", "Bearer "+c.key)
+	request.Header.Set("x-tunnel-secret", c.secret)
+	request.Header.Set("x-session-id", c.sessionID)
 	request.Header.Set("x-observed-ip", observed)
 	resp, err := c.http.Do(request)
 	if err != nil {
@@ -386,6 +405,7 @@ func (c *apiClient) reportStatus(ctx context.Context, state, reason string, cool
 	}
 	request.Header.Set("authorization", "Bearer "+c.key)
 	request.Header.Set("x-tunnel-secret", c.secret)
+	request.Header.Set("x-session-id", c.sessionID)
 	request.Header.Set("content-type", "application/json")
 
 	resp, err := c.http.Do(request)
@@ -600,6 +620,12 @@ func (p *loopback) trace(format string, args ...any) {
 // -- cli mode --------------------------------------------------------------
 
 func runCLI(ctx context.Context, client *apiClient, sess *session, root string, proxy *loopback, claudeBin string, keep bool, claudeArgs []string) error {
+	reported := false
+	defer func() {
+		if !reported {
+			client.report(ctx, outcome{status: statusIdle})
+		}
+	}()
 	configDir := filepath.Join(root, "profiles", sess.ProfileID, ".claude")
 	if err := refreshCredentials(ctx, client, sess, configDir); err != nil {
 		return err
@@ -640,7 +666,9 @@ func runCLI(ctx context.Context, client *apiClient, sess *session, root string, 
 	} else if runErr != nil {
 		code = -1
 	}
-	client.report(ctx, classifyRun(code, tail.String()))
+	result := classifyRun(code, tail.String())
+	client.report(ctx, result)
+	reported = result.status != ""
 	return runErr
 }
 
@@ -1328,13 +1356,14 @@ func firstLine(body []byte) string {
 func usage() {
 	fmt.Fprint(os.Stderr, `claude-box `+version+`
 
-  claude-box cli     --key <CARD_KEY> --host <URL> [-- <claude args>]
-  claude-box desktop --key <CARD_KEY> --host <URL> [--runtime <dir>]
+  claude-box cli     --key <CARD_KEY> --secret <TUNNEL_SECRET> --host <URL> [-- <claude args>]
+  claude-box desktop --key <CARD_KEY> --secret <TUNNEL_SECRET> --host <URL> [--runtime <dir>]
 
 Both modes verify the egress IP before handing over to the client.
 
 Environment:
   CCE_HOST          default for --host
+  CCE_TUNNEL_SECRET default for --secret
   CCE_GATEWAY       gateway host:port override
   CCE_TUNNEL_CA     PEM bundle to trust for the gateway (self-hosted/pinned)
   CCE_KERNEL_URL    where desktop mode fetches the browser kernel (baked-in

@@ -7,12 +7,11 @@ on a timer.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from core.lifecycle import (
-    COOLDOWN,
     COOLDOWN_MAX,
     IllegalTransition,
     allows,
@@ -20,8 +19,7 @@ from core.lifecycle import (
     mark,
     release_due_cooldowns,
 )
-from db.database import PROFILE_STATUSES
-
+from db.database import PROFILE_STATUSES, SCHEMA_PATH, Database
 
 _PORTS = iter(range(10500, 10600))
 
@@ -151,3 +149,18 @@ async def test_saving_credentials_keeps_a_cooldown_running(db) -> None:
     row = await db.get_profile("acct-sm")
     assert row["status"] == "COOLDOWN"
     assert row["cooldown_until"]
+
+
+async def test_existing_database_gets_session_column(tmp_path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    legacy_schema = SCHEMA_PATH.read_text().replace("    active_session_id TEXT,\n", "")
+    with sqlite3.connect(path) as connection:
+        connection.executescript(legacy_schema)
+    db = Database(path)
+    await db.connect()
+    try:
+        await _profile(db, "acct-legacy")
+        assert await db.claim_session("acct-legacy", "session-1")
+        assert (await db.get_profile("acct-legacy"))["active_session_id"] == "session-1"
+    finally:
+        await db.close()

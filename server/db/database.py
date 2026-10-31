@@ -68,6 +68,11 @@ class Database:
         sql = SCHEMA_PATH.read_text(encoding="utf-8")
         async with self._lock:
             await self.conn.executescript(sql)
+            cursor = await self.conn.execute("PRAGMA table_info(profiles)")
+            columns = {row[1] for row in await cursor.fetchall()}
+            await cursor.close()
+            if "active_session_id" not in columns:
+                await self.conn.execute("ALTER TABLE profiles ADD COLUMN active_session_id TEXT")
             await self.conn.commit()
 
     @asynccontextmanager
@@ -168,9 +173,36 @@ class Database:
         if status not in PROFILE_STATUSES:
             raise ValueError(f"unknown profile status: {status}")
         await self.execute(
-            "UPDATE profiles SET status = ?, cooldown_until = ? WHERE profile_id = ?",
-            (status, cooldown_until, profile_id),
+            "UPDATE profiles SET status = ?, cooldown_until = ?,"
+            " active_session_id = CASE WHEN ? = 'BUSY' THEN active_session_id ELSE NULL END"
+            " WHERE profile_id = ?",
+            (status, cooldown_until, status, profile_id),
         )
+
+    async def claim_session(self, profile_id: str, session_id: str) -> bool:
+        """Reserve an idle profile exactly once, even under concurrent requests."""
+        async with self._lock:
+            cursor = await self.conn.execute(
+                "UPDATE profiles SET status = 'BUSY', active_session_id = ?"
+                " WHERE profile_id = ? AND status = 'IDLE'",
+                (session_id, profile_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def finish_session(
+        self, profile_id: str, session_id: str, status: str, cooldown_until: str | None = None
+    ) -> bool:
+        if status not in {"IDLE", "COOLDOWN", "AUTH_EXPIRED", "PROXY_DEAD"}:
+            raise ValueError(f"invalid launcher status: {status}")
+        async with self._lock:
+            cursor = await self.conn.execute(
+                "UPDATE profiles SET status = ?, cooldown_until = ?, active_session_id = NULL"
+                " WHERE profile_id = ? AND status = 'BUSY' AND active_session_id = ?",
+                (status, cooldown_until, profile_id, session_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
 
     async def save_geo(self, profile_id: str, geo_json: str) -> None:
         await self.execute("UPDATE profiles SET geo_json = ? WHERE profile_id = ?", (geo_json, profile_id))
@@ -235,7 +267,7 @@ class Database:
         """Resolve a key that is active *and* unexpired, joined with its profile."""
         return await self.fetch_one(
             "SELECT d.*, p.local_proxy_port, p.expected_ip, p.os_type, p.noise_seed,"
-            " p.fingerprint_json, p.geo_json, p.status AS profile_status"
+            " p.fingerprint_json, p.geo_json, p.status AS profile_status, p.active_session_id"
             " FROM delivery_keys d JOIN profiles p ON p.profile_id = d.profile_id"
             " WHERE d.card_key = ? AND d.is_active = 1 AND d.expires_at > ?",
             (card_key, now_iso),

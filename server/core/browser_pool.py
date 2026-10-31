@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import tarfile
 import tempfile
 from contextlib import asynccontextmanager
@@ -19,10 +18,10 @@ from typing import Any, AsyncIterator
 
 from camoufox.async_api import AsyncCamoufox
 
-from core.lifecycle import mark
 from core.profile_manager import ProfileManager
 from core.proxy_inspector import ProxyGeoInfo, ProxyInspector
 from db.database import Database
+from util.ids import new_token
 
 CLAUDE_URL = "https://claude.ai"
 STEALTH_URL = "https://ipinfo.io/json"
@@ -59,7 +58,7 @@ class BrowserPool:
     ) -> AsyncIterator[Any]:
         """Yield a persistent, fingerprinted BrowserContext, or raise.
 
-        Ordering is deliberate: kill switch first (cheap, network), then dirs,
+        Ordering is deliberate: reserve the profile, check the proxy, then dirs,
         then launch. The scrub runs in `finally` so a crash still frees disk.
         """
         async with self._semaphore:
@@ -67,14 +66,14 @@ class BrowserPool:
             if profile is None:
                 raise BrowserPoolError(f"profile not found: {profile_id}")
 
-            geo: ProxyGeoInfo = await self._inspector.verify_and_inspect(profile_id)
-            fingerprint = json.loads(profile["fingerprint_json"])
-            self._profiles.browser_data_dir(profile_id).mkdir(parents=True, exist_ok=True)
-            # A banned or still-cooling profile is not free to browse on a whim;
-            # the state machine refuses the jump instead of silently overwriting.
-            await mark(self._db, profile_id, "BUSY")
+            browser_session = "browser-" + new_token(12)
+            if not await self._db.claim_session(profile_id, browser_session):
+                raise BrowserPoolError(f"profile is {profile['status']}: {profile_id}")
             self._active.add(profile_id)
             try:
+                geo: ProxyGeoInfo = await self._inspector.verify_and_inspect(profile_id)
+                fingerprint = json.loads(profile["fingerprint_json"])
+                self._profiles.browser_data_dir(profile_id).mkdir(parents=True, exist_ok=True)
                 proxy = _camoufox_proxy(profile["upstream_proxy_url"])
                 options: dict[str, Any] = {
                     "headless": self._headless if headless is None else headless,
@@ -97,14 +96,10 @@ class BrowserPool:
                 # Only un-set our own claim: something inside the context (a
                 # sync, a proxy kill) may already have set a status that outranks
                 # IDLE, and overwriting it would lose the signal.
-                latest = await self._db.get_profile(profile_id)
-                if latest and latest["status"] == "BUSY":
-                    await self._db.set_status(profile_id, "IDLE")
+                await self._db.finish_session(profile_id, browser_session, "IDLE")
             except BaseException:
                 # Leave the row usable; PROXY_DEAD is already set by the inspector.
-                current = await self._db.get_profile(profile_id)
-                if current and current["status"] == "BUSY":
-                    await self._db.set_status(profile_id, "IDLE")
+                await self._db.finish_session(profile_id, browser_session, "IDLE")
                 raise
             finally:
                 self._active.discard(profile_id)

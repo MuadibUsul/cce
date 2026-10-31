@@ -11,11 +11,11 @@ routes take the card key as a bearer token so a leaked URL alone is not enough.
 
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import os
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -24,20 +24,19 @@ from pydantic import BaseModel, Field
 
 from core.browser_pool import BrowserPool
 from core.crypto import CryptoError, decrypt_blob
-from core.lifecycle import COOLDOWN, IllegalTransition, cooldown_until, release_due_cooldowns
+from core.lifecycle import COOLDOWN, cooldown_until, release_due_cooldowns
 from core.lifecycle import mark as mark_status
 from core.profile_manager import ProfileError, ProfileManager
-from core.proxy_inspector import ProxyKillSwitchError, ProxyInspector
+from core.proxy_inspector import ProxyInspector, ProxyKillSwitchError
+from core.secret_export import export_secrets
 from core.singbox_manager import SingBoxError, SingBoxManager
-from db.database import PLAN_TIERS, Database, open_database
+from db.database import PLAN_TIERS, Database
 from util.ids import new_card_key, new_token
 
 DB_PATH = os.environ.get("CCE_DB_PATH", "data/cce.sqlite3")
 ADMIN_TOKEN_ENV = "CCE_ADMIN_TOKEN"
 TUNNEL_HOST = os.environ.get("CCE_TUNNEL_HOST", "")
 TUNNEL_PORT = int(os.environ.get("CCE_TUNNEL_PORT", "8443"))
-# Where issued tunnel secrets are mirrored for the gateway (CCE_TUNNEL_SECRETS).
-SECRETS_PATH = os.environ.get("CCE_TUNNEL_SECRETS", "")
 # Seconds between cooldown sweeps. Zero disables the task (tests drive it by hand).
 REAPER_INTERVAL = float(os.environ.get("CCE_REAPER_INTERVAL", "30"))
 
@@ -110,22 +109,20 @@ async def _launcher_key(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
     x_tunnel_secret: Annotated[str | None, Header()] = None,
+    x_session_id: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
-    """Resolve the card key, and the tunnel secret once the launcher has it.
-
-    `/launcher/session` is what *issues* the tunnel secret, so it cannot require
-    the secret itself -- it is required on every other launcher route. Both
-    factors are still needed to get anything out of the session: a leaked key
-    alone buys a session body, but no credentials and no tunnel.
-    """
+    """Require both delivery credentials and an active session on later routes."""
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing bearer card key")
     card_key = authorization.split(" ", 1)[1].strip()
     row = await state.db.active_delivery_key(card_key, _now_iso())
     if row is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "card key invalid, revoked or expired")
-    if request.url.path != "/launcher/session" and row["tunnel_secret"] != (x_tunnel_secret or ""):
+    if row["tunnel_secret"] != (x_tunnel_secret or ""):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "tunnel secret mismatch")
+    if request.url.path != "/launcher/session":
+        if row["profile_status"] != "BUSY" or not x_session_id or row["active_session_id"] != x_session_id:
+            raise HTTPException(status.HTTP_409_CONFLICT, "session is not active")
     return row
 
 
@@ -142,6 +139,7 @@ def create_app() -> FastAPI:
         state.pool = BrowserPool(state.db, state.profiles, state.inspector)
         await _restore_routes()
         await release_due_cooldowns(state.db)
+        await _export_secrets()
         if REAPER_INTERVAL > 0:
             state.reaper = asyncio.create_task(_reaper(REAPER_INTERVAL))
 
@@ -166,7 +164,8 @@ def create_app() -> FastAPI:
         while True:
             try:
                 await asyncio.sleep(interval)
-                await release_due_cooldowns(state.db)
+                if await release_due_cooldowns(state.db):
+                    await _export_secrets()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - a bad sweep must not kill the loop
@@ -220,8 +219,14 @@ def create_app() -> FastAPI:
             problems.append("CCE_ADMIN_TOKEN unset")
         if not os.environ.get("CCE_MASTER_KEY"):
             problems.append("CCE_MASTER_KEY unset")
+        if not TUNNEL_HOST:
+            problems.append("CCE_TUNNEL_HOST unset")
+        if not os.environ.get("CCE_TUNNEL_SECRETS"):
+            problems.append("CCE_TUNNEL_SECRETS unset")
         if state.singbox.available is False:
             problems.append("sing-box binary missing")
+        elif not state.singbox.running:
+            problems.append("sing-box not running")
         return JSONResponse({"ok": not problems, "problems": problems}, status_code=200 if not problems else 503)
 
     # -- admin -------------------------------------------------------------
@@ -244,6 +249,7 @@ def create_app() -> FastAPI:
             batch_id=body.batch_id,
         )
         state.singbox.register(record["profile_id"], record["local_proxy_port"], body.upstream_proxy_url)
+        await state.singbox.reload()
         return _public_profile(record)
 
     @app.get("/admin/profiles", dependencies=[admin])
@@ -268,6 +274,7 @@ def create_app() -> FastAPI:
             span = body.cooldown_seconds
             until = cooldown_until(COOLDOWN if span is None else timedelta(seconds=span))
         await mark_status(state.db, profile_id, body.status, until=until, force=True)
+        await _export_secrets()
         return {"profile_id": profile_id, "status": body.status, "cooldown_until": until}
 
     @app.post("/admin/profiles/{profile_id}/release", dependencies=[admin])
@@ -276,6 +283,7 @@ def create_app() -> FastAPI:
         if await state.db.get_profile(profile_id) is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "profile not found")
         await mark_status(state.db, profile_id, "IDLE", force=True)
+        await _export_secrets()
         return {"profile_id": profile_id, "status": "IDLE"}
 
     @app.post("/admin/profiles/{profile_id}/preflight", dependencies=[admin])
@@ -348,7 +356,11 @@ def create_app() -> FastAPI:
     @app.post("/launcher/session")
     async def launcher_session(row: Annotated[dict[str, Any], Depends(_launcher_key)]) -> dict[str, Any]:
         """Everything the launcher needs, minus the credential blob itself."""
+        session_id = new_token(24)
+        if not await state.db.claim_session(row["profile_id"], session_id):
+            raise HTTPException(status.HTTP_409_CONFLICT, f"profile is {row['profile_status']}")
         return {
+            "session_id": session_id,
             "profile_id": row["profile_id"],
             "plan_tier": row["plan_tier"],
             "os_type": row["os_type"],
@@ -359,7 +371,7 @@ def create_app() -> FastAPI:
             "noise_seed": row["noise_seed"],
             "fingerprint": _json_or_none(row.get("fingerprint_json")),
             "geo": _json_or_none(row.get("geo_json")),
-            "tunnel": {"host": TUNNEL_HOST, "port": TUNNEL_PORT, "secret": row["tunnel_secret"]},
+            "tunnel": {"host": TUNNEL_HOST, "port": TUNNEL_PORT},
             "expires_at": row["expires_at"],
             "has_credentials": row.get("claude_credentials_enc") is not None,
         }
@@ -387,7 +399,8 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         drift = bool(x_observed_ip) and x_observed_ip != row["expected_ip"]
         if drift:
-            await state.db.set_status(row["profile_id"], "PROXY_DEAD")
+            await state.db.finish_session(row["profile_id"], row["active_session_id"], "PROXY_DEAD")
+            await _export_secrets()
         return {"ok": True, "ip_drift": drift, "expected_ip": row["expected_ip"]}
 
     @app.post("/launcher/status")
@@ -409,12 +422,12 @@ def create_app() -> FastAPI:
             until = cooldown_until(
                 COOLDOWN if span is None else timedelta(seconds=span)
             )
-        try:
-            current = await mark_status(state.db, profile_id, body.status, until=until)
-        except IllegalTransition as exc:
-            # A late report from a session that already moved on is not an error.
-            return {"ok": True, "applied": False, "status": exc.current, "reason": str(exc)}
-        return {"ok": True, "applied": True, "status": current, "cooldown_until": until}
+        if body.status not in {"IDLE", "COOLDOWN", "AUTH_EXPIRED", "PROXY_DEAD"}:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid launcher status")
+        applied = await state.db.finish_session(profile_id, row["active_session_id"], body.status, until)
+        if applied:
+            await _export_secrets()
+        return {"ok": True, "applied": applied, "status": body.status, "cooldown_until": until}
 
     # -- debug -------------------------------------------------------------
 
@@ -430,26 +443,7 @@ def create_app() -> FastAPI:
 
 
 async def _export_secrets(*, force: bool = False) -> dict[str, Any]:
-    """Mirror active, unexpired tunnel secrets where the gateway can read them.
-
-    The gateway holds one secret per card key, not a single shared value, so it
-    needs the set shipped to it. Writing is idempotent and skipped when nothing
-    changed, which keeps a fleet-sized file from being rewritten per request.
-    """
-    path = Path(SECRETS_PATH) if SECRETS_PATH else Path(DB_PATH).with_suffix(".secrets")
-    rows = await state.db.fetch_all(
-        "SELECT card_key, tunnel_secret, expires_at FROM delivery_keys"
-        " WHERE is_active = 1 AND expires_at > ? ORDER BY card_key",
-        (_now_iso(),),
-    )
-    body = "# card_key secret expires_at\n" + "".join(
-        f"{row['card_key']} {row['tunnel_secret']} {row['expires_at']}\n" for row in rows
-    )
-    if force or not path.exists() or path.read_text(encoding="utf-8") != body:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
-        os.chmod(path, 0o600)
-    return {"path": str(path), "keys": len(rows)}
+    return await export_secrets(state.db, force=force)
 
 
 def _public_profile(row: dict[str, Any]) -> dict[str, Any]:

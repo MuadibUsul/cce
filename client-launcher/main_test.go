@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -182,8 +183,12 @@ func TestChunkEnvSplitsAndStaysASCII(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chunk: %v", err)
 	}
-	if len(env) != 2 {
-		t.Fatalf("40k of payload should split in two, got %d chunks", len(env))
+	wantChunks := 2
+	if runtime.GOOS == "windows" {
+		wantChunks = 20
+	}
+	if len(env) != wantChunks {
+		t.Fatalf("40k of payload should split in %d chunks, got %d", wantChunks, len(env))
 	}
 	for _, entry := range env {
 		for _, r := range entry {
@@ -463,6 +468,9 @@ func TestRefreshCredentialsSwapsAtomically(t *testing.T) {
 // TestLoopbackProbeReadsEgressIP runs the real loopback in front of a gateway
 // that answers every tunnel with a plain IP, which is what the kill switch reads.
 func TestLoopbackProbeReadsEgressIP(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Go on Windows ignores SSL_CERT_FILE for the fake origin certificate")
+	}
 	const wantIP = "203.0.113.7"
 
 	cert := selfSigned(t)
@@ -660,11 +668,11 @@ func TestKillSwitchExitsOnDrift(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/launcher/session":
-			if r.Header.Get("authorization") != "Bearer key-1" {
+			if r.Header.Get("authorization") != "Bearer key-1" || r.Header.Get("x-tunnel-secret") != "s3cret" {
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
-			_, _ = io.WriteString(w, `{"profile_id":"acct-1","expected_ip":"203.0.113.7","tunnel":{"host":"127.0.0.1","port":1,"secret":"s3cret"}}`)
+			_, _ = io.WriteString(w, `{"session_id":"sid-1","profile_id":"acct-1","expected_ip":"203.0.113.7","tunnel":{"host":"127.0.0.1","port":1}}`)
 		case "/launcher/heartbeat":
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -677,12 +685,22 @@ func TestKillSwitchExitsOnDrift(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
+	client.secret = "s3cret"
 	sess, err := client.session(context.Background())
 	if err != nil {
 		t.Fatalf("session: %v", err)
 	}
 	if sess.Tunnel.Secret != "s3cret" {
 		t.Fatalf("secret = %q", sess.Tunnel.Secret)
+	}
+}
+
+func TestControlPlaneRequiresHTTPSOutsideLoopback(t *testing.T) {
+	if _, err := newAPIClient("http://cp.example.com", "key"); err == nil {
+		t.Fatal("plaintext remote control plane must be refused")
+	}
+	if _, err := newAPIClient("http://127.0.0.1:8000", "key"); err != nil {
+		t.Fatalf("loopback development endpoint rejected: %v", err)
 	}
 }
 
@@ -765,23 +783,24 @@ func TestTailBufferKeepsTheEnd(t *testing.T) {
 }
 
 func TestReportStatusSendsBothFactors(t *testing.T) {
-	var gotBearer, gotSecret, gotBody string
+	var gotBearer, gotSecret, gotSession, gotBody string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBearer = r.Header.Get("authorization")
 		gotSecret = r.Header.Get("x-tunnel-secret")
+		gotSession = r.Header.Get("x-session-id")
 		body, _ := io.ReadAll(r.Body)
 		gotBody = string(body)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
-	client := &apiClient{base: server.URL, key: "card_abc", secret: "tun_xyz",
+	client := &apiClient{base: server.URL, key: "card_abc", secret: "tun_xyz", sessionID: "session-1",
 		http: &http.Client{Timeout: 5 * time.Second}}
 	if err := client.reportStatus(context.Background(), statusAuthExpired, "401", 0); err != nil {
 		t.Fatalf("reportStatus: %v", err)
 	}
-	if gotBearer != "Bearer card_abc" || gotSecret != "tun_xyz" {
-		t.Errorf("factors = %q / %q", gotBearer, gotSecret)
+	if gotBearer != "Bearer card_abc" || gotSecret != "tun_xyz" || gotSession != "session-1" {
+		t.Errorf("factors/session = %q / %q / %q", gotBearer, gotSecret, gotSession)
 	}
 	if !strings.Contains(gotBody, statusAuthExpired) {
 		t.Errorf("body = %q", gotBody)

@@ -12,8 +12,8 @@ import pytest_asyncio
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
-from db.database import Database  # noqa: E402
 from core.profile_manager import ProfileManager  # noqa: E402
+from db.database import Database  # noqa: E402
 
 MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="  # 32 bytes base64
 
@@ -21,6 +21,8 @@ MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="  # 32 bytes base64
 @pytest.fixture(autouse=True)
 def master_key(monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setenv("CCE_MASTER_KEY", MASTER_KEY)
+    # Unit tests generate identities without requiring a downloaded browser kernel.
+    monkeypatch.setattr("core.profile_manager.installed_verstr", lambda: "156.0.1-beta.36")
     return MASTER_KEY
 
 

@@ -16,9 +16,10 @@ from fastmcp import FastMCP
 
 from core.browser_pool import BrowserPool
 from core.profile_manager import ProfileError, ProfileManager
-from core.proxy_inspector import ProxyKillSwitchError, ProxyInspector
+from core.proxy_inspector import ProxyInspector, ProxyKillSwitchError
+from core.secret_export import export_secrets
 from core.singbox_manager import SingBoxManager
-from db.database import Database
+from db.database import PLAN_TIERS, Database
 from util.ids import new_card_key, new_token
 
 DB_PATH = os.environ.get("CCE_DB_PATH", "data/cce.sqlite3")
@@ -79,7 +80,9 @@ async def create_isolated_profile(
         os_type=os_type,
         batch_id=batch_id,
     )
-    services["singbox"].register(profile_id, record["local_proxy_port"], upstream_proxy_url)
+    for row in await services["db"].list_profiles():
+        services["singbox"].register(row["profile_id"], row["local_proxy_port"], row["upstream_proxy_url"])
+    await services["singbox"].reload()
     return _public(record)
 
 
@@ -134,6 +137,8 @@ async def reload_relay() -> dict[str, Any]:
 async def issue_customer_card_key(profile_id: str, plan_tier: str = "pro", valid_days: int = 30) -> dict[str, Any]:
     from datetime import datetime, timedelta, timezone
 
+    if plan_tier not in PLAN_TIERS or not 1 <= valid_days <= 365:
+        raise ProfileError("invalid plan tier or validity period")
     services = await _services_ready()
     profile = await services["db"].get_profile(profile_id)
     if profile is None:
@@ -150,6 +155,7 @@ async def issue_customer_card_key(profile_id: str, plan_tier: str = "pro", valid
             "expires_at": expires,
         }
     )
+    await export_secrets(services["db"])
     return {"card_key": card_key, "tunnel_secret": secret, "expires_at": expires}
 
 

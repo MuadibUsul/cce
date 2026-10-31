@@ -4,7 +4,7 @@ Antidetect Claude account cluster: deterministic fingerprints, one static
 residential IP per account, a whitelist-only TLS gateway, and a single binary
 that hands a customer a fully isolated Claude session.
 
-Spec: `SPEC.md` · Architecture: `docs/ARCHITECTURE.md` · Ops: `docs/OPERATIONS_SOP.md` · Tasks: `TASKS.md`
+Spec: `SPEC.md` · [Project guide / 项目架构与路径导览](docs/PROJECT_GUIDE.md) · Architecture: `docs/ARCHITECTURE.md` · Ops: `docs/OPERATIONS_SOP.md` · Tasks: `TASKS.md`
 
 ## Shape
 
@@ -22,7 +22,7 @@ Spec: `SPEC.md` · Architecture: `docs/ARCHITECTURE.md` · Ops: `docs/OPERATIONS
    kill switch, credential swap, kernel
                    │
                    ▼
-   gateway/ (Go)  SNI + CONNECT whitelist, bearer secret, port routing
+   gateway/ (Go)  authenticated CONNECT whitelist, profile-bound port routing
                    │
                    ▼
    *.anthropic.com · *.claude.ai · claude.com · platform.claude.com
@@ -57,21 +57,23 @@ cannot drift apart silently.
 - **Native profile isolation.** Each account gets its own `CLAUDE_CONFIG_DIR`
   (`~/.claude-box/profiles/<id>/.claude`, `0700`), wiped after exit unless
   `--keep`.
-- **A status is a permission, not a label.** `IDLE / BUSY / COOLDOWN /
-  AUTH_EXPIRED / PROXY_DEAD / BANNED` move through an explicit transition table
-  (`server/core/lifecycle.py`); an illegal jump is refused instead of written.
-  Cooldowns carry a `cooldown_until` deadline and a server-side sweeper frees
-  them when it passes, so a `kill -9`ed launcher cannot park an account forever.
+- **A status is a permission, not a label.** Only an `IDLE` profile can start a
+  customer or operator session. Claiming it sets `BUSY` atomically; later calls
+  require that session's identifier. `COOLDOWN`, `AUTH_EXPIRED`, `PROXY_DEAD`,
+  and `BANNED` block handover and remove the gateway grant. Expired cooldowns
+  are released by the server; a launcher killed before reporting `IDLE` still
+  requires the operator's `/release` action.
 - **Failure is reported, not guessed.** The gateway is a blind TLS splice and
   never sees an HTTP status inside the tunnel, so the launcher — the only party
   that sees the CLI exit — classifies it and `POST /launcher/status` marks
   `AUTH_EXPIRED` or starts a `COOLDOWN`. A successful `sync-credentials` clears
   `AUTH_EXPIRED` by itself.
-- **No plaintext credentials on disk.** The store is AES-GCM sealed on the
-  server, delivered over the tunnel, and extracted atomically into
-  `<configDir>.incoming` before the swap. The blob is sealed *and* opened with
-  the profile id as AEAD associated data, so a swapped ciphertext cannot
-  authenticate as another account.
+- **Credentials sealed on the server.** The store is AES-GCM sealed at rest,
+  delivered over the control plane's HTTPS connection, and extracted atomically
+  into the client's `<configDir>.incoming` before the swap. The local plaintext
+  copy is wiped after CLI exit unless `--keep`. The profile id is AEAD
+  associated data, so a swapped ciphertext cannot authenticate as another
+  account.
 
 ## Getting credentials in
 
@@ -154,9 +156,9 @@ export CCE_TUNNEL_CERT=data/gateway/tls.crt CCE_TUNNEL_KEY=data/gateway/tls.key
 .venv/bin/uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
-`/readyz` reports every missing secret. Admin routes need
-`x-admin-token: $CCE_ADMIN_TOKEN`; launcher routes need
-`Authorization: Bearer <card_key>`.
+Admin routes need `x-admin-token: $CCE_ADMIN_TOKEN`. Launcher session requests
+need `Authorization: Bearer <card_key>` and `x-tunnel-secret`; later requests
+also need the returned `x-session-id`.
 
 Provision, then hand over:
 
@@ -169,8 +171,8 @@ curl -H "x-admin-token: $CCE_ADMIN_TOKEN" -d '{"profile_id":"acct-001","plan_tie
 Customer:
 
 ```
-claude-box cli     --key <CARD_KEY> --host https://cp.example.com
-claude-box desktop --key <CARD_KEY> --host https://cp.example.com
+claude-box cli     --key <CARD_KEY> --secret <TUNNEL_SECRET> --host https://cp.example.com
+claude-box desktop --key <CARD_KEY> --secret <TUNNEL_SECRET> --host https://cp.example.com
 ```
 
 `cli` passes everything after `--` to `claude`. `desktop` needs a Camoufox
@@ -183,15 +185,16 @@ kernel: point `--runtime` at an extracted bundle or set `CCE_KERNEL_URL`.
 Server: `CCE_ADMIN_TOKEN`, `CCE_MASTER_KEY`, `CCE_TUNNEL_HOST`, `CCE_TUNNEL_PORT`,
 `CCE_TUNNEL_CERT`, `CCE_TUNNEL_KEY`, `CCE_TUNNEL_SECRETS`, `CCE_DB_PATH`.
 
-Launcher: `CCE_HOST`, `CCE_GATEWAY`, `CCE_TUNNEL_CA`, `CCE_KERNEL_URL`,
+Launcher: `CCE_HOST`, `CCE_TUNNEL_SECRET`, `CCE_GATEWAY`, `CCE_TUNNEL_CA`, `CCE_KERNEL_URL`,
 `CCE_HEADLESS`, `CCE_EXTRA_PREFS`.
 
-Every card key carries its own tunnel secret, so the gateway reads a set: point
-`CCE_TUNNEL_SECRETS` at the file the control plane writes (`/admin/keys`,
-`/admin/keys/{card_key}` and `/admin/tunnel-secrets` keep it current) and mount
-it read-only into the gateway. `CCE_TUNNEL_SECRET` still works as one static
-value for a single-machine run. The file is re-read when it changes, so a
-revocation lands without a restart.
+Every card key carries a separate tunnel secret. Point `CCE_TUNNEL_SECRETS` in
+the gateway at the file the control plane writes, and mount its parent directory
+read-only into the gateway container (the file is atomically replaced). Each
+grant binds the secret to one profile port and expiry. HTTP and MCP key issuance,
+revocation, and profile state changes refresh the file. The gateway checks
+expiry on every connection and closes established tunnels after a grant is
+removed. `CCE_TUNNEL_SECRETS` is required to start the gateway.
 
 `claude-box` verifies the gateway by name; a private CA goes in `CCE_TUNNEL_CA`,
 and desktop mode additionally needs that CA in the browser's own store because

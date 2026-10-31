@@ -100,12 +100,16 @@ def main() -> int:
             stdout=open("/tmp/live/gw.log", "w"), stderr=subprocess.STDOUT))
         wait_port(18443)
 
-        session = call("/launcher/session", {}, {"authorization": f"Bearer {key['card_key']}"})
+        session = call("/launcher/session", {}, {"authorization": f"Bearer {key['card_key']}",
+                                                 "x-tunnel-secret": key["tunnel_secret"]})
+        session["tunnel"]["secret"] = key["tunnel_secret"]
         print("session ip/port:", session["expected_ip"], session["local_proxy_port"])
         print("api reachable:", api_probe(session))
+        call("/launcher/status", {"status": "IDLE"}, {"authorization": f"Bearer {key['card_key']}",
+              "x-tunnel-secret": key["tunnel_secret"], "x-session-id": session["session_id"]})
 
         run = subprocess.run(
-            ["/tmp/live/claude-box", "cli", "--key", key["card_key"],
+            ["/tmp/live/claude-box", "cli", "--key", key["card_key"], "--secret", key["tunnel_secret"],
              "--host", f"http://127.0.0.1:{PORT}", "-v", "--"] + ARGS, cwd=".",
             env=dict(base, CCE_TUNNEL_CA="/tmp/live/tls.crt", SSL_CERT_FILE="/tmp/live/tls.crt"),
             capture_output=True, text=True, timeout=600,

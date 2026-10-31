@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import pytest_asyncio
-
 from api.app import create_app
 from conftest import MASTER_KEY
 
@@ -149,16 +150,15 @@ async def test_key_issue_and_launcher_session(client: httpx.AsyncClient) -> None
     )
     assert session.status_code == 200
     body = session.json()
+    assert body["session_id"]
     assert body["profile_id"] == "acct-api"
     assert body["plan_tier"] == "max_5x"
     assert body["fingerprint"]["user_agent"].startswith("Mozilla/5.0")
-    assert body["tunnel"]["secret"] == key["tunnel_secret"]
+    assert "secret" not in body["tunnel"]
 
 
 @pytest.mark.asyncio
-async def test_launcher_session_issues_the_secret_and_others_require_it(client: httpx.AsyncClient) -> None:
-    """The session route is what hands out the tunnel secret, so it accepts the
-    key alone; every other launcher route needs both factors."""
+async def test_launcher_session_requires_both_factors(client: httpx.AsyncClient) -> None:
     await _create_profile(client)
     key = (
         await client.post(
@@ -168,9 +168,12 @@ async def test_launcher_session_issues_the_secret_and_others_require_it(client: 
     auth = {"authorization": f"Bearer {key['card_key']}"}
 
     assert (await client.post("/launcher/session")).status_code == 401
-    assert (await client.post("/launcher/session", headers=auth)).status_code == 200
+    assert (await client.post("/launcher/session", headers=auth)).status_code == 403
+    headers = auth | {"x-tunnel-secret": key["tunnel_secret"]}
+    session = await client.post("/launcher/session", headers=headers)
+    assert session.status_code == 200
 
-    # Everything else needs the secret as well.
+    # Later routes need both factors and the active session identifier.
     assert (await client.post("/launcher/heartbeat", headers=auth)).status_code == 403
     assert (await client.get("/launcher/credentials", headers=auth)).status_code == 403
     assert (
@@ -178,6 +181,10 @@ async def test_launcher_session_issues_the_secret_and_others_require_it(client: 
             "/launcher/credentials", headers=auth | {"x-tunnel-secret": "wrong"}
         )
     ).status_code == 403
+    assert (await client.get("/launcher/credentials", headers=headers)).status_code == 409
+    assert (await client.get("/launcher/credentials", headers=headers | {
+        "x-session-id": session.json()["session_id"]
+    })).status_code == 404
 
 
 @pytest.mark.asyncio
@@ -191,9 +198,10 @@ async def test_issued_secret_is_exported_for_the_gateway(client: httpx.AsyncClie
             "/admin/keys", headers=admin(), json={"profile_id": "acct-api", "plan_tier": "pro"}
         )
     ).json()
-    path = app_module.Path(app_module.DB_PATH).with_suffix(".secrets")
+    path = app_module.Path(app_module.state.db.path).with_suffix(".secrets")
     body = path.read_text()
     assert f"{key['card_key']} {key['tunnel_secret']}" in body
+    assert " 10001\n" in body
 
     await client.delete(f"/admin/keys/{key['card_key']}", headers=admin())
     assert key["tunnel_secret"] not in path.read_text()
@@ -216,17 +224,64 @@ async def test_revoked_key_rejected(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_claim_is_exclusive_and_stale_reports_cannot_finish_a_new_session(
+    client: httpx.AsyncClient,
+) -> None:
+    await _create_profile(client)
+    key = (await client.post("/admin/keys", headers=admin(), json={"profile_id": "acct-api", "plan_tier": "pro"})).json()
+    auth = {"authorization": f"Bearer {key['card_key']}", "x-tunnel-secret": key["tunnel_secret"]}
+    first, rejected = await asyncio.gather(
+        client.post("/launcher/session", headers=auth),
+        client.post("/launcher/session", headers=auth),
+    )
+    assert sorted([first.status_code, rejected.status_code]) == [200, 409]
+    if first.status_code != 200:
+        first = rejected
+
+    await client.post("/admin/profiles/acct-api/release", headers=admin())
+    second = await client.post("/launcher/session", headers=auth)
+    assert second.status_code == 200
+    assert second.json()["session_id"] != first.json()["session_id"]
+    stale = await client.post("/launcher/status", headers=auth | {
+        "x-session-id": first.json()["session_id"]
+    }, json={"status": "IDLE"})
+    assert stale.status_code == 409
+    assert (await client.get("/admin/profiles/acct-api", headers=admin())).json()["status"] == "BUSY"
+
+
+@pytest.mark.asyncio
+async def test_banned_and_cooling_profiles_cannot_start_or_use_the_gateway(client: httpx.AsyncClient) -> None:
+    from api import app as app_module
+
+    await _create_profile(client)
+    key = (await client.post("/admin/keys", headers=admin(), json={"profile_id": "acct-api", "plan_tier": "pro"})).json()
+    auth = {"authorization": f"Bearer {key['card_key']}", "x-tunnel-secret": key["tunnel_secret"]}
+    path = app_module.Path(app_module.state.db.path).with_suffix(".secrets")
+    assert key["tunnel_secret"] in path.read_text()
+    for blocked in ("COOLDOWN", "BANNED", "PROXY_DEAD"):
+        await client.post("/admin/profiles/acct-api/status", headers=admin(), json={"status": blocked})
+        assert (await client.post("/launcher/session", headers=auth)).status_code == 409
+        assert key["tunnel_secret"] not in path.read_text()
+    await client.post("/admin/profiles/acct-api/release", headers=admin())
+    assert key["tunnel_secret"] in path.read_text()
+    assert (await client.post("/launcher/session", headers=auth)).status_code == 200
+
+
+@pytest.mark.asyncio
 async def _launcher_headers(client: httpx.AsyncClient, profile_id: str = "acct-api") -> dict[str, str]:
-    """Both factors, as the launcher sends them."""
+    """Both factors and the claimed session, as the launcher sends them."""
     key = (
         await client.post(
             "/admin/keys", headers=admin(), json={"profile_id": profile_id, "plan_tier": "pro"}
         )
     ).json()
-    return {
+    headers = {
         "authorization": f"Bearer {key['card_key']}",
         "x-tunnel-secret": key["tunnel_secret"],
     }
+    session = await client.post("/launcher/session", headers=headers)
+    assert session.status_code == 200
+    return headers | {"x-session-id": session.json()["session_id"]}
 
 
 async def test_heartbeat_flags_ip_drift(client: httpx.AsyncClient) -> None:
@@ -241,6 +296,8 @@ async def test_heartbeat_flags_ip_drift(client: httpx.AsyncClient) -> None:
         "x-tunnel-secret": key["tunnel_secret"],
         "x-observed-ip": "198.51.100.4",
     }
+    session = await client.post("/launcher/session", headers=headers)
+    headers["x-session-id"] = session.json()["session_id"]
 
     body = (await client.post("/launcher/heartbeat", headers=headers)).json()
     assert body["ip_drift"] is True
@@ -256,10 +313,11 @@ async def test_credentials_404_when_unsynced(client: httpx.AsyncClient) -> None:
             "/admin/keys", headers=admin(), json={"profile_id": "acct-api", "plan_tier": "pro"}
         )
     ).json()
-    response = await client.get(
-        "/launcher/credentials",
-        headers={"authorization": f"Bearer {key['card_key']}", "x-tunnel-secret": key["tunnel_secret"]},
-    )
+    headers = {"authorization": f"Bearer {key['card_key']}", "x-tunnel-secret": key["tunnel_secret"]}
+    session = await client.post("/launcher/session", headers=headers)
+    response = await client.get("/launcher/credentials", headers=headers | {
+        "x-session-id": session.json()["session_id"]
+    })
     assert response.status_code == 404
 
 
@@ -345,9 +403,7 @@ async def test_illegal_launcher_report_is_not_an_error(client: httpx.AsyncClient
 
     response = await client.post("/launcher/status", headers=headers, json={"status": "BUSY"})
 
-    assert response.status_code == 200
-    assert response.json()["applied"] is False
-    assert response.json()["status"] == "BANNED"
+    assert response.status_code == 409
 
 
 @pytest.mark.asyncio

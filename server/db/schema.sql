@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     geo_json TEXT,
     claude_credentials_enc BLOB,
     status TEXT DEFAULT 'IDLE' CHECK(status IN ('IDLE', 'BUSY', 'COOLDOWN', 'AUTH_EXPIRED', 'PROXY_DEAD', 'BANNED')),
+    active_session_id TEXT,
     cooldown_until TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(batch_id) REFERENCES payment_batches(batch_id)

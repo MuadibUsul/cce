@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
-
 import mcp_server
+import pytest
 from conftest import MASTER_KEY
 
 
@@ -92,7 +91,7 @@ async def test_preflight_reports_kill_switch_failure(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_issue_key_creates_active_key() -> None:
+async def test_issue_key_creates_active_key(tmp_path) -> None:
     await mcp_server.create_isolated_profile(
         profile_id="acct-key",
         local_proxy_port=None,
@@ -105,6 +104,9 @@ async def test_issue_key_creates_active_key() -> None:
     row = await services["db"].get_delivery_key(issued["card_key"])
     assert row is not None and row["plan_tier"] == "max_20x"
     assert row["tunnel_secret"] == issued["tunnel_secret"]
+    exported = (tmp_path / "mcp.secrets").read_text()
+    assert f"{issued['card_key']} {issued['tunnel_secret']}" in exported
+    assert f" {row['expires_at']} 10001\n" in exported
 
 
 @pytest.mark.asyncio

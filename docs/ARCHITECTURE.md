@@ -118,13 +118,13 @@ config.
 `ProxyInspector.verify_and_inspect()` queries `ip-api.com` **through the profile's
 own proxy** and compares the answer against the frozen `expected_ip`. Any
 deviation — timeout, unreachable, non-JSON, no IP, drift — raises
-`ProxyKillSwitchError` and marks the row `PROXY_DEAD`. It runs at profile creation
-and before every `acquire_context()`, i.e. before a browser is burned.
+`ProxyKillSwitchError` and marks the row `PROXY_DEAD`. It runs before every
+`acquire_context()`, i.e. before a browser is burned.
 
 The probe host `api.ipify.org` was dropped because it is not whitelisted;
 `ip-api.com` is (plain HTTP).
 
-### 4.3 Secrets never land in plaintext
+### 4.3 Server credentials are sealed at rest
 
 `crypto.py` seals with AES-GCM under `CCE_MASTER_KEY`, prefix `CCE1`. Critically
 the **profile id is the AEAD associated data**, on seal *and* on open: without it a
@@ -137,7 +137,8 @@ exit unless `--keep`.
 
 `newWhitelist()` treats `*.x` as "suffix or apex", and `allows()` lowercases,
 strips a trailing dot and any `:port`. Everything else is `403` before a dial.
-Both the SNI path and the CONNECT path check it, so the two cannot disagree.
+Raw TLS with an origin SNI is refused because it has no delivery credential or
+profile port. The authenticated CONNECT path checks the whitelist.
 
 Default list: `*.anthropic.com`, `*.claude.ai`, `claude.com`,
 `platform.claude.com`, `*.stripe.com`, `*.cloudflare.com`, `ipinfo.io`,
@@ -147,19 +148,18 @@ are load-bearing — `claude auth login` sends the browser to
 `platform.claude.com`. Without both, no token can ever be minted. `defaultDomains()`
 carries the same reasoning so the two cannot drift apart silently.
 
-### 4.5 TLS is passed through, except where it must be terminated
+### 4.5 TLS terminates at the gateway, then passes through to the origin
 
 `handle()` sniffs the first byte: `0x16` is a TLS record. `handleTLS()` then peeks
 the ClientHello.
 
-- Whitelisted SNI → the bytes are replayed and the socket spliced to the origin,
-  so TLS runs **end to end** and certificate pinning inside Claude still holds.
-- No SNI (an IP was dialled) or non-whitelisted SNI → the handshake is terminated
-  here and the tunnel is served inside, where the CONNECT target is checked
-  instead. Missing certificate is a refusal, not a silent downgrade.
+- Origin SNI → refused before any origin dial.
+- Gateway SNI or no SNI → gateway TLS is terminated; the authenticated CONNECT
+  request is checked, and the inner Claude TLS stream passes through to the
+  origin. Missing gateway certificate is a refusal.
 
-Routing: the launcher stamps `x-profile-port`; `dialOrigin()` checks it against
-`profileRange()` 10001-11000 so a lying launcher is harmless.
+Routing: the launcher stamps `x-profile-port`; the gateway requires that it
+match the authenticated key's exported port. No direct-dial fallback exists.
 
 ## 5. Port map
 
@@ -168,7 +168,7 @@ Routing: the launcher stamps `x-profile-port`; `dialOrigin()` checks it against
 was a real outage: after a control-plane restart every profile stayed in the DB
 with no inbound, and `reload` refused an empty map. `_restore_routes()` now
 re-registers every row at startup and calls `reload()`, swallowing
-`SingBoxError` per profile.
+`SingBoxError` per profile. Creating a profile also reloads the route map.
 
 sing-box 1.14 rejects the legacy inbound `sniff` field; it is route rule 0 as
 `{"action": "sniff"}` so that sniffing still precedes routing.
@@ -223,10 +223,10 @@ the one carrying `#checkbox`.
 - **State root is user-owned**, `~/.claude-box` at `0700`; profile ids are
   validated (`_assert_safe_id`) before becoming path components.
 - **`extractTarGz` has a traversal guard** — archives come off the wire.
-- **Gateway auth is a bearer set with constant-time compare**, hot-reloaded from
-  file. `CCE_TUNNEL_SECRET` (single static value) still works for one machine.
-- **`/launcher/session` is the issuer** and is therefore exempt from the tunnel
-  secret; it is authenticated by the card key instead.
+- **Gateway grants bind secrets to ports and expiry**, hot-reloaded from the
+  exported file. The gateway refuses startup without that file path.
+- **`/launcher/session` requires both delivery credentials** and atomically
+  reserves an idle profile. Later routes require its session identifier.
 - **A test CA must be a real CA + leaf**; Firefox rejects a self-signed leaf that
   is also `CA:TRUE`. `certutil` must seed the exact profile the kernel opens.
 
