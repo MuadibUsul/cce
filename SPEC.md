@@ -27,8 +27,6 @@ Generate the project following this exact layout:
 claude-cluster-engine/
 ├── server/
 │   ├── pyproject.toml
-│   ├── config/
-│   │   └── singbox_template.json
 │   ├── db/
 │   │   ├── schema.sql
 │   │   └── database.py             # Async SQLite CRUD wrapper (aiosqlite)
