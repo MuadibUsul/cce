@@ -58,7 +58,6 @@ claude-cluster-engine/
 │  ├─ core/                      profile、浏览器、代理、加密、状态等业务逻辑
 │  ├─ db/database.py             SQLite 连接、查询和事务
 │  ├─ db/schema.sql              数据表定义
-│  ├─ config/singbox_template.json  参考模板；当前渲染代码不读取它
 │  └─ util/ids.py                key/token 生成
 ├─ gateway/
 │  ├─ main.go                    TLS CONNECT 网关
@@ -109,7 +108,8 @@ HTTP 路由分为三组：
 | `POST /admin/tunnel-secrets` | 强制重新导出网关授权文件。 |
 | `POST /launcher/session` | 领取 BUSY 会话，返回 profile 和网关信息。 |
 | `GET /launcher/credentials`、`GET /launcher/credentials/b64` | 服务端解密数据库中的凭证，返回 tar.gz；后者以 Base64 JSON 返回，是调试接口。 |
-| `POST /launcher/heartbeat`、`POST /launcher/status` | 汇报实际 IP、报告会话结果并改变状态。 |
+| `POST /launcher/heartbeat` | 汇报实际 IP 并续租当前 BUSY 会话。 |
+| `POST /launcher/status` | 报告会话结果并改变状态。 |
 
 ### 核心模块
 
@@ -142,10 +142,10 @@ delivery_keys.card_key           │
 ```
 
 - `payment_batches` 存批次、BIN 前缀、账单国家及最大账号数。
-- `profiles` 是核心实体。保存 `local_proxy_port`、`upstream_proxy_url`、`expected_ip`、`os_type`、`fingerprint_json`、`geo_json`、加密后的 `claude_credentials_enc`、`status`、`active_session_id`、`cooldown_until` 等。上游代理账号保存在服务端，不需要交给客户端。
+- `profiles` 是核心实体。保存 `local_proxy_port`、`upstream_proxy_url`、`expected_ip`、`os_type`、`fingerprint_json`、`geo_json`、加密后的 `claude_credentials_enc`、`status`、`active_session_id`、`last_heartbeat_at`、`cooldown_until` 等。上游代理账号保存在服务端，不需要交给客户端。
 - `delivery_keys` 将 `card_key` 绑定到 profile，另存 `tunnel_secret`、套餐、到期时间和启用状态。一个 profile 可有多条 key，但 BUSY 状态限制同时领取会话。
 
-SQLite 使用 WAL 和外键。旧库需要的 `active_session_id` 字段由 `Database.migrate` 处理。创建新字段或变更状态语义时，应同时检查 `schema.sql`、`database.py`、API 和测试。
+SQLite 使用 WAL 和外键。旧库需要的 `active_session_id` 与 `last_heartbeat_at` 字段由 `Database.migrate` 处理；后者补齐时会给遗留的 BUSY 行写入当前时间，避免部署瞬间释放仍在运行的会话。创建新字段或变更状态语义时，应同时检查 `schema.sql`、`database.py`、API 和测试。
 
 ## 4. 网络链路、端口与信任边界
 
@@ -191,12 +191,12 @@ SQLite 使用 WAL 和外键。旧库需要的 `active_session_id` 字段由 `Dat
 
 管理端签发 key 后，客户获得 `card_key` 和独立的 `tunnel_secret`。`claude-box cli` 或 `claude-box desktop` 先领取会话，再建立隧道并检查出口 IP：
 
-- **CLI**：从控制面下载凭证包，解出到客户机 `~/.claude-box/profiles/<profile_id>/.claude`，设置 `CLAUDE_CONFIG_DIR`、代理环境变量和时区，启动官方 `claude`。退出后按结果报告 `IDLE`、`COOLDOWN` 或 `AUTH_EXPIRED` 等状态；默认清理该 profile 的本地凭证目录，`--keep` 可保留。
-- **Desktop**：准备 Camoufox 内核（`--runtime` 或内核下载 URL），使用客户机 `~/.claude-box/profiles/<profile_id>/browser_data`，重放服务端保存的指纹/地理设置，通过本机代理打开 `https://claude.ai`。
+- **CLI**：从控制面下载凭证包，解出到客户机 `~/.claude-box/profiles/<profile_id>/.claude`，设置 `CLAUDE_CONFIG_DIR`、代理环境变量和时区，启动官方 `claude`。退出后按结果报告 `IDLE`、`COOLDOWN` 或 `AUTH_EXPIRED` 等状态；会话期间每 30 秒向控制面发心跳以续租。正常退出、捕获中断信号或异常退出都会无条件删除该 profile 的本地明文目录；每次启动前还会先清掉上次被强杀遗留的明文目录（刚更新过的目录会跳过，见第 10 节）。
+- **Desktop**：准备 Camoufox 内核（`--runtime` 或内核下载 URL），使用客户机 `~/.claude-box/profiles/<profile_id>/browser_data`，重放服务端保存的指纹/地理设置，通过本机代理打开 `https://claude.ai`。启动预清理只删除 `.claude`，不动持久化的 `browser_data`。
 
 ### D. 撤销、失效与恢复
 
-撤销 key、key 到期、profile 变为不可用状态或出口 IP 漂移，都会影响网关授权。控制面更新数据库并重导出授权文件；网关从文件刷新授权。`COOLDOWN` 到期由控制面定时任务恢复为 `IDLE`（默认检查间隔 30 秒，可配置）。如果启动器被强制杀死而没有报告结束，`BUSY` 不会仅靠 cooldown 清理任务自动释放，需要运营人员调用 `/admin/profiles/{profile_id}/release` 检查并处理。
+撤销 key、key 到期、profile 变为不可用状态或出口 IP 漂移，都会影响网关授权。控制面更新数据库并重导出授权文件；网关从文件刷新授权。控制面定时任务（默认检查间隔 30 秒，可配置）同时处理两类残留：`COOLDOWN` 到期后恢复 `IDLE`，以及超过租约阈值（120 秒）没有心跳的 `BUSY` 账号恢复 `IDLE`、清空 `active_session_id` 并重导出授权。因此启动器被强杀或断电时，账号最多在一个租约窗口加一个巡检间隔后自动回归可用；`/admin/profiles/{profile_id}/release` 仍可用于立即手动释放。
 
 ## 6. 状态、会话与凭证的区别
 
@@ -207,12 +207,13 @@ SQLite 使用 WAL 和外键。旧库需要的 `active_session_id` 字段由 `Dat
 | `expected_ip` | `profiles` | 运营端登记的固定出口 IP，供预检和启动器探测比对。 |
 | `card_key` + `tunnel_secret` | `delivery_keys` / 客户端持有 | 控制面领取会话需要两者；网关 CONNECT 使用 `tunnel_secret`、端口和到期时间，不再校验 `card_key`。key 是否可用还受启用位和 profile 状态约束。 |
 | `session_id` | `profiles.active_session_id` / 客户端持有 | 当前 BUSY 会话的标识，用于后续凭证、心跳和状态请求。它不是长期授权 key。 |
+| `last_heartbeat_at` | `profiles` | 租约时间戳。领取会话时写入，每次心跳刷新；超过 120 秒未刷新即被定时任务回收。 |
 | `claude_credentials_enc` | `profiles` | 服务端加密后的 Claude 凭证包；与隧道认证 secret 不同。 |
 
 | profile 状态 | 语义与常见后续动作 |
 | --- | --- |
 | `IDLE` | 可领取新的客户/浏览器会话。 |
-| `BUSY` | 已被某个 `session_id` 占用；正常结束报告回 `IDLE`，异常结束可转入其他状态。 |
+| `BUSY` | 已被某个 `session_id` 占用并持有心跳租约；正常结束报告回 `IDLE`，心跳中断 120 秒后由定时任务自动释放，异常结束也可转入其他状态。 |
 | `COOLDOWN` | 使用节奏限制后的暂休，截止后由定时任务释放。 |
 | `AUTH_EXPIRED` | Claude 登录凭证失效，需要重新同步/导入凭证。 |
 | `PROXY_DEAD` | 上游代理失败或实际出口 IP 不符合预期，需要修复并复检。 |
@@ -233,7 +234,7 @@ SQLite 使用 WAL 和外键。旧库需要的 `active_session_id` 字段由 `Dat
 | `data/singbox/config.json` | `SingBoxManager` | 当前生成的 sing-box 配置，含上游代理连接信息。 |
 | `data/gateway/tls.crt`、`data/gateway/tls.key` | Go 网关 | 默认外层 TLS 证书及私钥；缺失时网关可生成自签证书，路径可配置。 |
 | `dist/claude-box-<os>-<arch>`、`dist/gateway-<os>-<arch>` | `Makefile` | 跨平台二进制产物，Windows 文件带 `.exe`。 |
-| `~/.claude-box/profiles/<profile_id>/.claude` | 客户端 CLI | 客户端临时解密的 Claude 配置/凭证；默认退出时清理。Windows 的 `~` 是运行用户的主目录。 |
+| `~/.claude-box/profiles/<profile_id>/.claude` | 客户端 CLI | 客户端临时解密的 Claude 配置/凭证；正常退出与中断都会无条件删除，启动时还会预清理上次残留。Windows 的 `~` 是运行用户的主目录。 |
 | `~/.claude-box/profiles/<profile_id>/browser_data` | 客户端 Desktop | 客户端浏览器持久化资料，与服务器上的同名目录不是同一份文件。 |
 
 `secret_export.py` 用临时文件加原子替换更新授权文件。如果网关在容器中读取该文件，应挂载**父目录**，使新文件也可见；只挂载旧文件本身可能在替换后仍读到旧 inode。文件格式与解析逻辑分别在 `server/core/secret_export.py` 和 `gateway/main.go`，变更时须同时更新。
@@ -249,7 +250,7 @@ SQLite 使用 WAL 和外键。旧库需要的 `active_session_id` 字段由 `Dat
 | 控制面 | `CCE_MASTER_KEY` | 32 字节密钥的 Base64 文本，用于 AES-GCM 凭证封存；`/readyz` 要求已设置。 |
 | 控制面 | `CCE_TUNNEL_HOST` / `CCE_TUNNEL_PORT` | 返回给客户端的网关地址；端口默认 `8443`。 |
 | 控制面 / 网关 | `CCE_TUNNEL_SECRETS` | 共享的授权文件路径；网关启动必须配置，控制面的 `/readyz` 也检查该环境变量。 |
-| 控制面 | `CCE_REAPER_INTERVAL` | cooldown 清理间隔，默认 30 秒；`0` 可停用。 |
+| 控制面 | `CCE_REAPER_INTERVAL` | cooldown 与 BUSY 租约的清理间隔，默认 30 秒；`0` 可停用。 |
 | 网关 | `CCE_TUNNEL_CERT` / `CCE_TUNNEL_KEY` | 网关 TLS 证书/私钥路径，默认在 `data/gateway/`。 |
 | 网关 | `CCE_TUNNEL_SAN` | 自签证书需要覆盖的主机名列表。 |
 | 客户端 | `CCE_HOST` / `CCE_TUNNEL_SECRET` | `--host` / `--secret` 的环境变量默认值。 |
@@ -292,7 +293,7 @@ Pop-Location
 
 | 想确认/修改什么 | 从哪里开始 | 对应验证 |
 | --- | --- | --- |
-| 管理 API、会话鉴权、状态报告 | `server/api/app.py`、`server/db/database.py` | `tests/test_api.py`、`tests/test_lifecycle.py` |
+| 管理 API、会话鉴权、状态报告、BUSY 租约回收 | `server/api/app.py`、`server/db/database.py`、`server/core/lifecycle.py` | `tests/test_api.py`、`tests/test_lifecycle.py` |
 | 批次/profile 创建、指纹和目录 | `server/core/profile_manager.py` | `tests/test_profile_manager.py` |
 | 出口 IP、代理故障阻断 | `server/core/proxy_inspector.py` | `tests/test_proxy_killswitch.py` |
 | 登录与凭证封存 | `server/core/browser_pool.py`、`server/core/login.py`、`server/core/crypto.py` | `tests/test_login.py`、`tests/test_credential_sync.py`、`tests/test_crypto.py` |
@@ -308,10 +309,10 @@ Pop-Location
 
 - `SPEC.md` 是目标规格，判断某功能是否真正存在应以当前代码和测试为准。例如仓库目前没有独立的云端流式分发模块。
 - 创建 profile 只建立身份、端口和文件目录；要确认出口健康，需要显式预检或进入会触发预检的浏览器流程。客户端启动还有自己的出口探测。
-- `server/config/singbox_template.json` 是参考文件；当前生效配置由 `SingBoxManager.render()` 直接生成。
+- `server/config/` 目录已移除，不再有 `singbox_template.json`；当前生效配置全部由 `SingBoxManager.render()` 直接生成。
 - 授权文件只保存当前可用的 key。其行包含 `card_key secret expires_at profile_port`，但当前网关解析时以 **secret** 为索引，校验期限和 profile 端口；文件里的 `card_key` 并未参与 CONNECT 校验。网关按导出文件变化撤销连接，不直接感知 SQLite 事务。
-- `BUSY` 没有自动租约超时。强杀客户端后需要人工确认账号安全并释放；cooldown 定时清理不会处理这种残留 BUSY。
+- `BUSY` 有服务端租约：领取和心跳刷新 `last_heartbeat_at`，超过 120 秒静默即由定时任务回收为 `IDLE`。客户端每 30 秒心跳一次，因此正常长会话不会被误回收；人工 `/release` 仍可立即释放。代价是客户端若被冻结超过阈值，服务端会把账号交还给下一位客户，而旧进程恢复后其状态报告会因 `session_id` 不匹配而被拒。
 - 浏览器登录可能碰到需要人工完成的密码、SSO 或验证码步骤。自动同步失败可走凭证导入流程。
-- 服务端凭证密文与客户机运行时解出的明文副本处于不同安全边界；`--keep` 会保留客户端目录，需要按实际使用场景管理该机器。
+- 服务端凭证密文与客户机运行时解出的明文副本处于不同安全边界。`--keep` 已移除：客户端在退出（含 Ctrl-C）时无条件擦除明文目录，并在每次启动前清理残留。预清理按凭证文件的修改时间判断，最近 30 秒内仍新鲜的目录视为另一个终端正在运行的会话并跳过，因此可以同时开两个不同账号。
 
 更多背景看根目录 `README.md`、设计说明 `docs/ARCHITECTURE.md` 和运行流程 `docs/OPERATIONS_SOP.md`。排查实际行为时先看当前入口文件和测试。

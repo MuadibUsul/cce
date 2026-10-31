@@ -72,6 +72,18 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done · `[!]` blocked
 - [x] `claude-box-<os>-<arch>` artefact naming in `Makefile`, `make dist-check`
       asserting names and the baked default, and e2e building the released name.
 
+## Phase 8 — BUSY lease, plaintext hard-wipe, dead files
+- [x] `profiles.last_heartbeat_at` plus a `Database.migrate` backfill for rows
+      that were already `BUSY`, so a deploy does not free live sessions.
+- [x] The claim and every `/launcher/heartbeat` stamp the lease; the 30 s sweep
+      reclaims a `BUSY` row silent for 120 s to `IDLE` and re-exports the grant.
+- [x] Launcher keeps a 30 s keepalive for the whole session instead of the two
+      fire-and-forget startup beats.
+- [x] `--keep` removed: the CLI wipe is unconditional on exit, Ctrl-C included.
+- [x] Start-time prune clears `.claude`/`.claude.incoming` left by a killed run
+      while keeping `browser_data`.
+- [x] `server/config/singbox_template.json` deleted; nothing read it.
+
 ## Known limits
 - hCaptcha is reachable and clickable, but from a **datacenter** exit it escalates
   from the checkbox to an image puzzle and the token stays empty. Everything up
@@ -103,3 +115,8 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done · `[!]` blocked
   browser launch. Renamed to `/tmp/drive_click.py`.
 - The sing-box route map is memory-only; a control-plane restart used to leave
   profiles unroutable and `reload` refusing an empty map. Now rebuilt from the DB.
+- A `BUSY` flag without a clock is a lock nobody owns after a crash; the lease
+  had to live in the row (`last_heartbeat_at`) so the server, not the dead
+  launcher, is the authority on when the session is over.
+- A heartbeat is a `WHERE status='BUSY' AND active_session_id=?` update: stamping
+  unconditionally would revive a row the sweep had already handed to someone else.

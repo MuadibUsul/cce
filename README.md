@@ -55,14 +55,14 @@ cannot drift apart silently.
   accepts it. Timezone, locale, geolocation and WebRTC IP are overlaid from the
   live exit IP.
 - **Native profile isolation.** Each account gets its own `CLAUDE_CONFIG_DIR`
-  (`~/.claude-box/profiles/<id>/.claude`, `0700`), wiped after exit unless
-  `--keep`.
+  (`~/.claude-box/profiles/<id>/.claude`, `0700`), always wiped after exit.
 - **A status is a permission, not a label.** Only an `IDLE` profile can start a
-  customer or operator session. Claiming it sets `BUSY` atomically; later calls
-  require that session's identifier. `COOLDOWN`, `AUTH_EXPIRED`, `PROXY_DEAD`,
-  and `BANNED` block handover and remove the gateway grant. Expired cooldowns
-  are released by the server; a launcher killed before reporting `IDLE` still
-  requires the operator's `/release` action.
+  customer or operator session. Claiming it sets `BUSY` atomically and starts a
+  heartbeat lease; later calls require that session's identifier. `COOLDOWN`,
+  `AUTH_EXPIRED`, `PROXY_DEAD`, and `BANNED` block handover and remove the
+  gateway grant. Expired cooldowns are released by the server, and a `BUSY` row
+  that goes 120 s without a heartbeat is reclaimed the same way — a `kill -9`ed
+  launcher no longer strands the account.
 - **Failure is reported, not guessed.** The gateway is a blind TLS splice and
   never sees an HTTP status inside the tunnel, so the launcher — the only party
   that sees the CLI exit — classifies it and `POST /launcher/status` marks
@@ -71,7 +71,8 @@ cannot drift apart silently.
 - **Credentials sealed on the server.** The store is AES-GCM sealed at rest,
   delivered over the control plane's HTTPS connection, and extracted atomically
   into the client's `<configDir>.incoming` before the swap. The local plaintext
-  copy is wiped after CLI exit unless `--keep`. The profile id is AEAD
+  copy is wiped unconditionally after CLI exit, and each start first clears any
+  copy a killed run left behind. The profile id is AEAD
   associated data, so a swapped ciphertext cannot authenticate as another
   account.
 
@@ -142,8 +143,10 @@ The launcher posts `{"status": "AUTH_EXPIRED" | "COOLDOWN" | "PROXY_DEAD" |
 "IDLE", ...}` to `/launcher/status` after the CLI exits. `AUTH_EXPIRED` comes
 from a 401/403/`invalid_grant`/`not logged in` message, `COOLDOWN` from a 429 or
 a usage-limit line (with a `try again in <n> <unit>` hint, floored at 30 min).
-A clean exit reports `IDLE`; a Ctrl-C reports nothing. Operators can override
-with `POST /admin/profiles/{id}/status` or free a stuck row with
+A clean exit reports `IDLE`; a Ctrl-C reports nothing. While a session runs the
+launcher heartbeats every 30 s, and the server reclaims a `BUSY` row after 120 s
+of silence. Operators can still override with
+`POST /admin/profiles/{id}/status` or free a row immediately with
 `POST /admin/profiles/{id}/release`.
 
 ## Run
@@ -183,7 +186,8 @@ kernel: point `--runtime` at an extracted bundle or set `CCE_KERNEL_URL`.
 ## Environment
 
 Server: `CCE_ADMIN_TOKEN`, `CCE_MASTER_KEY`, `CCE_TUNNEL_HOST`, `CCE_TUNNEL_PORT`,
-`CCE_TUNNEL_CERT`, `CCE_TUNNEL_KEY`, `CCE_TUNNEL_SECRETS`, `CCE_DB_PATH`.
+`CCE_TUNNEL_CERT`, `CCE_TUNNEL_KEY`, `CCE_TUNNEL_SECRETS`, `CCE_DB_PATH`,
+`CCE_REAPER_INTERVAL`.
 
 Launcher: `CCE_HOST`, `CCE_TUNNEL_SECRET`, `CCE_GATEWAY`, `CCE_TUNNEL_CA`, `CCE_KERNEL_URL`,
 `CCE_HEADLESS`, `CCE_EXTRA_PREFS`.

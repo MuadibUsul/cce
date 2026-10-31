@@ -59,7 +59,6 @@ server/                     control plane (Python 3.11+, FastAPI + MCP)
   core/login.py             sign-in page driving primitives
   db/schema.sql             tables
   db/database.py            data access
-  config/singbox_template.json
   util/ids.py               card keys, tokens
 
 gateway/                    Go, TLS whitelist relay
@@ -131,7 +130,9 @@ the **profile id is the AEAD associated data**, on seal *and* on open: without i
 ciphertext copied between rows authenticates as the wrong account. On the client,
 `refreshCredentials()` extracts into `<configDir>.incoming` and only then renames,
 so an interrupted extraction cannot leave a half store. The directory is wiped on
-exit unless `--keep`.
+exit unconditionally; a start-time prune clears anything a killed run left
+behind, skipping stores stamped within the last heartbeat interval so a
+concurrent session on the same machine is not pulled out from under itself.
 
 ### 4.4 The gateway is the only door
 
@@ -163,8 +164,9 @@ match the authenticated key's exported port. No direct-dial fallback exists.
 
 ## 5. Port map
 
-`SingBoxManager` renders one inbound per profile from
-`config/singbox_template.json` and reloads. The map is **memory-only** — which
+`SingBoxManager` renders one inbound per profile from the in-memory route map and
+reloads. Nothing reads a template file: `render()` builds the whole document
+directly. The map is **memory-only** — which
 was a real outage: after a control-plane restart every profile stayed in the DB
 with no inbound, and `reload` refused an empty map. `_restore_routes()` now
 re-registers every row at startup and calls `reload()`, swallowing
@@ -226,7 +228,9 @@ the one carrying `#checkbox`.
 - **Gateway grants bind secrets to ports and expiry**, hot-reloaded from the
   exported file. The gateway refuses startup without that file path.
 - **`/launcher/session` requires both delivery credentials** and atomically
-  reserves an idle profile. Later routes require its session identifier.
+  reserves an idle profile. Later routes require its session identifier. The
+  reservation is leased: the launcher heartbeats every 30 s and the server
+  reclaims the row after 120 s of silence.
 - **A test CA must be a real CA + leaf**; Firefox rejects a self-signed leaf that
   is also `CA:TRUE`. `certutil` must seed the exact profile the kernel opens.
 
@@ -239,8 +243,16 @@ relay) and a desktop fidelity assertion. `tests/live.py` uses the real network,
 the real kernel and the real gateway.
 
 Status is covered explicitly: every transition pair, the cooldown clamp, the
-sweeper's selectivity (an expired row is freed, a fresh one and a `BUSY` row are
-not), and the exit classifier's quiet cases.
+sweeper's selectivity (an expired cooldown is freed, a fresh one is not), the
+`BUSY` lease (a silent row is reclaimed, a heartbeating one is not, and a late
+report from the reclaimed session is refused), and the exit classifier's quiet
+cases. The launcher side asserts the unconditional wipe, the start-time prune and
+that the keepalive stops when the session ends.
+
+**`BUSY` is a lease, not a lock.** `/launcher/session` stamps
+`last_heartbeat_at`, every heartbeat re-stamps it, and the same 30 s sweep frees
+a row silent for 120 s. Without it a `kill -9`ed launcher stranded the account
+until an operator released it by hand.
 
 Unit tests never need network, an account or a kernel: the browser is faked at
 the context boundary, and the login tests use a fake `claude` binary plus a
