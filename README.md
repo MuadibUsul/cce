@@ -109,6 +109,23 @@ Launcher: `CCE_HOST`, `CCE_GATEWAY`, `CCE_TUNNEL_CA`, `CCE_KERNEL_URL`,
 and desktop mode additionally needs that CA in the browser's own store because
 Firefox trusts NSS, not `SSL_CERT_FILE`.
 
+## End-to-end harnesses
+
+`tests/e2e/` drives the real binaries through a fake control plane, a fake
+residential relay and a TLS origin that answers as `ipinfo.io`/`ip-api.com`/
+`claude.ai`. No Anthropic account needed:
+
+```
+.venv/bin/python tests/e2e/run_cli.py                        # happy path
+E2E_EXPECTED=198.51.100.4 .venv/bin/python tests/e2e/run_cli.py   # IP drift aborts
+E2E_DEAD_RELAY=1 .venv/bin/python tests/e2e/run_cli.py      # dead exit aborts
+CCE_RUNTIME=<camoufox bundle> .venv/bin/python tests/e2e/run_desktop.py
+```
+
+The desktop harness asserts the browser presents the stored UA, `Accept-Language`
+and timezone offset. It imports a throwaway CA with `certutil` first, because
+Firefox validates against NSS rather than `SSL_CERT_FILE`.
+
 ## Notes for operators
 
 - Camoufox needs `<runtime>/../.0.5_FLAG` (a fingerprint-database version marker);
