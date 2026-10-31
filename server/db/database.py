@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Sequence
 
@@ -28,6 +29,10 @@ PROFILE_STATUSES = (
 )
 
 PLAN_TIERS = ("pro", "max_5x", "max_20x", "env_only")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class Database:
@@ -73,6 +78,16 @@ class Database:
             await cursor.close()
             if "active_session_id" not in columns:
                 await self.conn.execute("ALTER TABLE profiles ADD COLUMN active_session_id TEXT")
+            if "last_heartbeat_at" not in columns:
+                await self.conn.execute("ALTER TABLE profiles ADD COLUMN last_heartbeat_at TIMESTAMP")
+                # Rows that are already BUSY have no recorded lease time. Give
+                # them one full window from the migration instead of freeing
+                # them the moment this process starts.
+                await self.conn.execute(
+                    "UPDATE profiles SET last_heartbeat_at = ?"
+                    " WHERE status = 'BUSY' AND last_heartbeat_at IS NULL",
+                    (_now_iso(),),
+                )
             await self.conn.commit()
 
     @asynccontextmanager
@@ -172,20 +187,51 @@ class Database:
     ) -> None:
         if status not in PROFILE_STATUSES:
             raise ValueError(f"unknown profile status: {status}")
+        # A forced BUSY starts a fresh lease rather than inheriting a stale one.
         await self.execute(
             "UPDATE profiles SET status = ?, cooldown_until = ?,"
+            " last_heartbeat_at = CASE WHEN ? = 'BUSY' THEN ? ELSE NULL END,"
             " active_session_id = CASE WHEN ? = 'BUSY' THEN active_session_id ELSE NULL END"
             " WHERE profile_id = ?",
-            (status, cooldown_until, status, profile_id),
+            (status, cooldown_until, status, _now_iso(), status, profile_id),
         )
 
     async def claim_session(self, profile_id: str, session_id: str) -> bool:
         """Reserve an idle profile exactly once, even under concurrent requests."""
         async with self._lock:
             cursor = await self.conn.execute(
-                "UPDATE profiles SET status = 'BUSY', active_session_id = ?"
+                "UPDATE profiles SET status = 'BUSY', active_session_id = ?,"
+                " last_heartbeat_at = ?"
                 " WHERE profile_id = ? AND status = 'IDLE'",
-                (session_id, profile_id),
+                (session_id, _now_iso(), profile_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def touch_heartbeat(self, profile_id: str, session_id: str) -> bool:
+        """Extend the lease. False when this session no longer owns the row."""
+        async with self._lock:
+            cursor = await self.conn.execute(
+                "UPDATE profiles SET last_heartbeat_at = ?"
+                " WHERE profile_id = ? AND status = 'BUSY' AND active_session_id = ?",
+                (_now_iso(), profile_id, session_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def reclaim_stale_busy(self, profile_id: str, cutoff: str) -> bool:
+        """Free a BUSY row whose lease expired, unless a heartbeat just landed.
+
+        The cutoff is re-checked in the UPDATE, so a heartbeat that arrives
+        between the sweep's SELECT and this call keeps the row BUSY.
+        """
+        async with self._lock:
+            cursor = await self.conn.execute(
+                "UPDATE profiles SET status = 'IDLE', active_session_id = NULL,"
+                " last_heartbeat_at = NULL, cooldown_until = NULL"
+                " WHERE profile_id = ? AND status = 'BUSY'"
+                " AND (last_heartbeat_at IS NULL OR last_heartbeat_at <= ?)",
+                (profile_id, cutoff),
             )
             await self.conn.commit()
             return cursor.rowcount == 1
@@ -197,7 +243,8 @@ class Database:
             raise ValueError(f"invalid launcher status: {status}")
         async with self._lock:
             cursor = await self.conn.execute(
-                "UPDATE profiles SET status = ?, cooldown_until = ?, active_session_id = NULL"
+                "UPDATE profiles SET status = ?, cooldown_until = ?, active_session_id = NULL,"
+                " last_heartbeat_at = NULL"
                 " WHERE profile_id = ? AND status = 'BUSY' AND active_session_id = ?",
                 (status, cooldown_until, profile_id, session_id),
             )

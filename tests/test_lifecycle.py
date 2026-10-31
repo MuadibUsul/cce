@@ -13,11 +13,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from core.lifecycle import (
     COOLDOWN_MAX,
+    LEASE_TIMEOUT,
     IllegalTransition,
     allows,
     cooldown_until,
     mark,
+    reclaim_stale_busy,
     release_due_cooldowns,
+    sweep_reaperable,
 )
 from db.database import PROFILE_STATUSES, SCHEMA_PATH, Database
 
@@ -154,6 +157,8 @@ async def test_saving_credentials_keeps_a_cooldown_running(db) -> None:
 async def test_existing_database_gets_session_column(tmp_path) -> None:
     path = tmp_path / "legacy.sqlite3"
     legacy_schema = SCHEMA_PATH.read_text().replace("    active_session_id TEXT,\n", "")
+    # The lease column did not exist in the oldest databases either.
+    legacy_schema = legacy_schema.replace("    last_heartbeat_at TIMESTAMP,\n", "")
     with sqlite3.connect(path) as connection:
         connection.executescript(legacy_schema)
     db = Database(path)
@@ -162,5 +167,99 @@ async def test_existing_database_gets_session_column(tmp_path) -> None:
         await _profile(db, "acct-legacy")
         assert await db.claim_session("acct-legacy", "session-1")
         assert (await db.get_profile("acct-legacy"))["active_session_id"] == "session-1"
+        assert (await db.get_profile("acct-legacy"))["last_heartbeat_at"]
     finally:
         await db.close()
+
+
+async def test_claim_stamps_the_lease(db) -> None:
+    await _profile(db)
+    await db.claim_session("acct-sm", "session-1")
+    row = await db.get_profile("acct-sm")
+    assert row["status"] == "BUSY"
+    assert row["last_heartbeat_at"]
+
+
+async def test_heartbeat_extends_only_the_owning_session(db) -> None:
+    await _profile(db)
+    await db.claim_session("acct-sm", "session-1")
+    await db.execute("UPDATE profiles SET last_heartbeat_at = '2000-01-01T00:00:00+00:00'")
+
+    assert await db.touch_heartbeat("acct-sm", "session-1")
+    assert (await db.get_profile("acct-sm"))["last_heartbeat_at"] > "2000-01-01T00:00:00+00:00"
+
+    # A stale session cannot extend a lease it no longer owns.
+    assert not await db.touch_heartbeat("acct-sm", "session-old")
+    # And a finished row has nothing to extend.
+    await db.finish_session("acct-sm", "session-1", "IDLE")
+    assert not await db.touch_heartbeat("acct-sm", "session-1")
+
+
+async def test_stale_busy_row_is_reclaimed_after_the_lease_expires(db) -> None:
+    await _profile(db, "acct-dead")
+    await _profile(db, "acct-live")
+    now = datetime.now(timezone.utc)
+    await db.claim_session("acct-dead", "session-dead")
+    await db.claim_session("acct-live", "session-live")
+    await db.execute(
+        "UPDATE profiles SET last_heartbeat_at = ? WHERE profile_id = 'acct-dead'",
+        ((now - LEASE_TIMEOUT - timedelta(seconds=1)).isoformat(),),
+    )
+    await db.execute(
+        "UPDATE profiles SET last_heartbeat_at = ? WHERE profile_id = 'acct-live'",
+        ((now - timedelta(seconds=30)).isoformat(),),
+    )
+
+    reclaimed = await reclaim_stale_busy(db, now=now)
+
+    assert reclaimed == ["acct-dead"]
+    dead = await db.get_profile("acct-dead")
+    assert dead["status"] == "IDLE"
+    assert dead["active_session_id"] is None
+    assert dead["last_heartbeat_at"] is None
+    live = await db.get_profile("acct-live")
+    assert live["status"] == "BUSY"
+    assert live["active_session_id"] == "session-live"
+
+
+async def test_lease_uses_its_documented_default() -> None:
+    assert LEASE_TIMEOUT == timedelta(seconds=120)
+
+
+async def test_reclaim_is_idempotent_and_leaves_other_states_alone(db) -> None:
+    await _profile(db, "acct-busy")
+    await _profile(db, "acct-cool")
+    now = datetime.now(timezone.utc)
+    await db.claim_session("acct-busy", "session-1")
+    await db.execute("UPDATE profiles SET last_heartbeat_at = '2000-01-01T00:00:00+00:00'")
+    await db.set_status("acct-cool", "COOLDOWN", (now + timedelta(minutes=10)).isoformat())
+
+    assert await reclaim_stale_busy(db, now=now) == ["acct-busy"]
+    assert await reclaim_stale_busy(db, now=now) == []
+    assert (await db.get_profile("acct-cool"))["status"] == "COOLDOWN"
+
+
+async def test_report_after_a_reclaim_is_refused_but_the_row_is_free(db) -> None:
+    """A reclaimed session's late status report must not write over the new IDLE."""
+    await _profile(db)
+    await db.claim_session("acct-sm", "session-1")
+    await db.execute("UPDATE profiles SET last_heartbeat_at = '2000-01-01T00:00:00+00:00'")
+    await reclaim_stale_busy(db)
+
+    assert not await db.finish_session("acct-sm", "session-1", "COOLDOWN")
+    assert (await db.get_profile("acct-sm"))["status"] == "IDLE"
+
+
+async def test_sweep_frees_both_cooldowns_and_dead_leases(db) -> None:
+    await _profile(db, "acct-cool")
+    await _profile(db, "acct-dead")
+    now = datetime.now(timezone.utc)
+    await db.set_status("acct-cool", "COOLDOWN", (now - timedelta(minutes=1)).isoformat())
+    await db.claim_session("acct-dead", "session-1")
+    await db.execute("UPDATE profiles SET last_heartbeat_at = '2000-01-01T00:00:00+00:00'")
+
+    freed = await sweep_reaperable(db, now=now)
+
+    assert sorted(freed) == ["acct-cool", "acct-dead"]
+    assert (await db.get_profile("acct-cool"))["status"] == "IDLE"
+    assert (await db.get_profile("acct-dead"))["status"] == "IDLE"

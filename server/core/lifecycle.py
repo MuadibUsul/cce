@@ -33,6 +33,10 @@ ALLOWED: dict[str, frozenset[str]] = {
 COOLDOWN = timedelta(minutes=30)
 # The longest a single cooldown may ask for, so a bug cannot park a fleet.
 COOLDOWN_MAX = timedelta(hours=24)
+# How long a BUSY row may go without a heartbeat before it is reclaimed. A
+# launcher that is killed or loses power never reports its own exit, so the
+# lease has to expire on the server or the account is stranded forever.
+LEASE_TIMEOUT = timedelta(seconds=120)
 
 
 class IllegalTransition(RuntimeError):
@@ -128,11 +132,39 @@ async def release_due_cooldowns(db: Database, *, now: datetime | None = None) ->
     return released
 
 
-async def sweep_reaperable(db: Database, *, now: datetime | None = None) -> list[str]:
-    """Rows a busy-but-abandoned process left behind.
+async def reclaim_stale_busy(
+    db: Database,
+    *,
+    now: datetime | None = None,
+    lease: timedelta | None = None,
+) -> list[str]:
+    """Free BUSY rows whose launcher stopped heartbeating.
 
-    A launcher that is `kill -9`ed never reports anything, so `BUSY` can stick
-    forever. There is no lease column, so the sweep is by cooldown deadline:
-    a profile parked in COOLDOWN past its time is exactly `release_due_cooldowns`.
+    A `kill -9` or a power loss leaves `BUSY` behind with nobody to report the
+    exit. There is no callback that survives that, so the row carries a lease:
+    the claim and every heartbeat stamp `last_heartbeat_at`, and here a row that
+    has not been stamped within `lease` is put back to `IDLE`. The row is
+    re-checked in the UPDATE, so a heartbeat racing the sweep wins.
+
+    Rows that went BUSY before the lease column existed have no stamp; the
+    migration gives them one, so a deploy does not free live sessions.
     """
-    return await release_due_cooldowns(db, now=now)
+    cutoff = ((now or _now()) - (lease or LEASE_TIMEOUT)).isoformat()
+    rows = await db.fetch_all(
+        "SELECT profile_id FROM profiles"
+        " WHERE status = 'BUSY' AND (last_heartbeat_at IS NULL OR last_heartbeat_at <= ?)",
+        (cutoff,),
+    )
+    reclaimed: list[str] = []
+    for row in rows:
+        profile_id = str(row["profile_id"])
+        if await db.reclaim_stale_busy(profile_id, cutoff):
+            reclaimed.append(profile_id)
+    return reclaimed
+
+
+async def sweep_reaperable(db: Database, *, now: datetime | None = None) -> list[str]:
+    """Everything the periodic sweep frees: expired cooldowns and dead leases."""
+    released = await release_due_cooldowns(db, now=now)
+    reclaimed = await reclaim_stale_busy(db, now=now)
+    return released + reclaimed

@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from core.browser_pool import BrowserPool
 from core.crypto import CryptoError, decrypt_blob
-from core.lifecycle import COOLDOWN, cooldown_until, release_due_cooldowns
+from core.lifecycle import COOLDOWN, cooldown_until, sweep_reaperable
 from core.lifecycle import mark as mark_status
 from core.profile_manager import ProfileError, ProfileManager
 from core.proxy_inspector import ProxyInspector, ProxyKillSwitchError
@@ -37,7 +37,8 @@ DB_PATH = os.environ.get("CCE_DB_PATH", "data/cce.sqlite3")
 ADMIN_TOKEN_ENV = "CCE_ADMIN_TOKEN"
 TUNNEL_HOST = os.environ.get("CCE_TUNNEL_HOST", "")
 TUNNEL_PORT = int(os.environ.get("CCE_TUNNEL_PORT", "8443"))
-# Seconds between cooldown sweeps. Zero disables the task (tests drive it by hand).
+# Seconds between cooldown and lease sweeps. Zero disables the task (tests drive
+# it by hand).
 REAPER_INTERVAL = float(os.environ.get("CCE_REAPER_INTERVAL", "30"))
 
 
@@ -126,6 +127,24 @@ async def _launcher_key(
     return row
 
 
+async def _reaper_loop(interval: float) -> None:
+    """Free expired cooldowns and dead BUSY leases.
+
+    Runs on the server because only the server may write status; a launcher that
+    is `kill -9`ed can never report its own recovery, so its lease has to expire
+    here instead of waiting for an operator.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            if await sweep_reaperable(state.db):
+                await _export_secrets()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a bad sweep must not kill the loop
+            pass
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Claude Cluster Engine", version="0.1.0", docs_url="/docs")
 
@@ -138,10 +157,10 @@ def create_app() -> FastAPI:
         state.singbox = SingBoxManager()
         state.pool = BrowserPool(state.db, state.profiles, state.inspector)
         await _restore_routes()
-        await release_due_cooldowns(state.db)
+        await sweep_reaperable(state.db)
         await _export_secrets()
         if REAPER_INTERVAL > 0:
-            state.reaper = asyncio.create_task(_reaper(REAPER_INTERVAL))
+            state.reaper = asyncio.create_task(_reaper_loop(REAPER_INTERVAL))
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
@@ -154,22 +173,6 @@ def create_app() -> FastAPI:
             state.reaper = None
         await state.singbox.stop()
         await state.db.close()
-
-    async def _reaper(interval: float) -> None:
-        """Free cooldowns that have run out.
-
-        Runs on the server because only the server may write status; a launcher
-        that is `kill -9`ed can never report its own recovery.
-        """
-        while True:
-            try:
-                await asyncio.sleep(interval)
-                if await release_due_cooldowns(state.db):
-                    await _export_secrets()
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - a bad sweep must not kill the loop
-                pass
 
     async def _restore_routes() -> None:
         """Rebuild the port map from the database, then bring sing-box back up.
@@ -397,6 +400,8 @@ def create_app() -> FastAPI:
         row: Annotated[dict[str, Any], Depends(_launcher_key)],
         x_observed_ip: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
+        # The lease is what keeps the reclaim sweep off this row.
+        await state.db.touch_heartbeat(row["profile_id"], row["active_session_id"])
         drift = bool(x_observed_ip) and x_observed_ip != row["expected_ip"]
         if drift:
             await state.db.finish_session(row["profile_id"], row["active_session_id"], "PROXY_DEAD")

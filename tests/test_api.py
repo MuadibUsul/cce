@@ -306,6 +306,64 @@ async def test_heartbeat_flags_ip_drift(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_refreshes_the_lease(client: httpx.AsyncClient) -> None:
+    """A live launcher must never look like an abandoned one."""
+    from api import app as app_module
+
+    await _create_profile(client)
+    headers = await _launcher_headers(client)
+    await app_module.state.db.execute(
+        "UPDATE profiles SET last_heartbeat_at = '2000-01-01T00:00:00+00:00'"
+    )
+
+    assert (await client.post("/launcher/heartbeat", headers=headers)).status_code == 200
+
+    row = await app_module.state.db.get_profile("acct-api")
+    assert row["last_heartbeat_at"] > "2000-01-01T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_reaper_frees_a_silent_busy_session(client: httpx.AsyncClient, monkeypatch) -> None:
+    """A killed launcher never reports; the sweep must free its lease itself."""
+    from api import app as app_module
+
+    await _create_profile(client)
+    headers = await _launcher_headers(client)
+    await app_module.state.db.execute(
+        "UPDATE profiles SET last_heartbeat_at = '2000-01-01T00:00:00+00:00'"
+    )
+
+    monkeypatch.setattr(app_module, "REAPER_INTERVAL", 0.05)
+    if app_module.state.reaper is not None:
+        app_module.state.reaper.cancel()
+        try:
+            await app_module.state.reaper
+        except asyncio.CancelledError:
+            pass
+    app_module.state.reaper = asyncio.create_task(app_module._reaper_loop(app_module.REAPER_INTERVAL))
+
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if (await app_module.state.db.get_profile("acct-api"))["status"] == "IDLE":
+            break
+
+    profile = (await client.get("/admin/profiles/acct-api", headers=admin())).json()
+    assert profile["status"] == "IDLE"
+    assert profile["active_session_id"] is None
+    # The freed row can be claimed again by the same key.
+    assert (await client.post("/launcher/session", headers=headers)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_does_not_resurrect_a_finished_session(client: httpx.AsyncClient) -> None:
+    await _create_profile(client)
+    headers = await _launcher_headers(client)
+    await client.post("/launcher/status", headers=headers, json={"status": "AUTH_EXPIRED"})
+
+    assert (await client.post("/launcher/heartbeat", headers=headers)).status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_credentials_404_when_unsynced(client: httpx.AsyncClient) -> None:
     await _create_profile(client)
     key = (

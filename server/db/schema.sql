@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS profiles (
     claude_credentials_enc BLOB,
     status TEXT DEFAULT 'IDLE' CHECK(status IN ('IDLE', 'BUSY', 'COOLDOWN', 'AUTH_EXPIRED', 'PROXY_DEAD', 'BANNED')),
     active_session_id TEXT,
+    -- Lease clock: set when a session is claimed and refreshed on every
+    -- heartbeat. A BUSY row that stops beating has lost its client and is
+    -- reclaimed by the server sweep.
+    last_heartbeat_at TIMESTAMP,
     cooldown_until TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(batch_id) REFERENCES payment_batches(batch_id)
