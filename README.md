@@ -4,7 +4,7 @@ Antidetect Claude account cluster: deterministic fingerprints, one static
 residential IP per account, a whitelist-only TLS gateway, and a single binary
 that hands a customer a fully isolated Claude session.
 
-Spec: `SPEC.md` · Ops: `docs/OPERATIONS_SOP.md` · Tasks: `TASKS.md`
+Spec: `SPEC.md` · Architecture: `docs/ARCHITECTURE.md` · Ops: `docs/OPERATIONS_SOP.md` · Tasks: `TASKS.md`
 
 ## Shape
 
