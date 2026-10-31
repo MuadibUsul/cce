@@ -80,7 +80,10 @@ Roughly 7.3k lines of source. `client-launcher/main.go` (1136) > `gateway/main.g
   stops at the batch.
 - `profiles` — one sellable identity. Holds the frozen `fingerprint_json`, the
   frozen `expected_ip`, `local_proxy_port` (UNIQUE), `upstream_proxy_url`,
-  `os_type`, `noise_seed`, sealed `claude_credentials_enc`, and a status enum.
+  `os_type`, `noise_seed`, sealed `claude_credentials_enc`, a status enum and
+  `cooldown_until`. Status moves only through `server/core/lifecycle.py`, whose
+  transition table is exhaustive over the six states; an illegal jump raises
+  `IllegalTransition` instead of being written.
 - `delivery_keys` — the customer credential. `card_key` is presented by the
   launcher; `tunnel_secret` is the second factor and is **per key**, so one
   revoked card does not disturb the fleet.
@@ -229,11 +232,15 @@ the one carrying `#checkbox`.
 
 ## 9. Verification
 
-88 Python tests, plus `gofmt -l` (empty) / `go vet` / `go test` in both Go
+114 Python tests, plus `gofmt -l` (empty) / `go vet` / `go test` in both Go
 modules. `tests/e2e/` drives the real binaries through a fake control plane, fake
 residential relay and TLS origin — three CLI scenarios (happy, IP drift, dead
 relay) and a desktop fidelity assertion. `tests/live.py` uses the real network,
 the real kernel and the real gateway.
+
+Status is covered explicitly: every transition pair, the cooldown clamp, the
+sweeper's selectivity (an expired row is freed, a fresh one and a `BUSY` row are
+not), and the exit classifier's quiet cases.
 
 Unit tests never need network, an account or a kernel: the browser is faked at
 the context boundary, and the login tests use a fake `claude` binary plus a

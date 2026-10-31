@@ -19,6 +19,7 @@ import http.server
 import io
 import json
 import os
+import platform
 import shutil
 import socket
 import ssl
@@ -35,9 +36,17 @@ EXIT_IP = os.environ.get("E2E_IP", "203.0.113.7")
 CERT_NAMES = ["claude.ai", "ipinfo.io", "ip-api.com"]
 
 
+def artifact_name() -> str:
+    """The released file name, mirroring the Makefile (`claude-box-<os>-<arch>`)."""
+    os_name = {"linux": "linux", "darwin": "darwin"}.get(sys.platform, sys.platform)
+    arch = "arm64" if platform.machine() in ("arm64", "aarch64") else "x64"
+    return f"claude-box-{os_name}-{arch}" + (".exe" if os_name == "windows" else "")
+
+
 def build(name: str, module: str) -> str:
     """Compile a Go binary into a temp dir (cached across runs in E2E_BIN)."""
-    out = os.path.join(bin_dir(), name)
+    # The launcher is addressed by the name a customer would download.
+    out = os.path.join(bin_dir(), artifact_name() if name == "claude-box" else name)
     if os.path.exists(out):
         return out
     source = os.path.join(os.path.dirname(os.path.dirname(ROOT)), module)
@@ -189,6 +198,9 @@ class Control(http.server.ThreadingHTTPServer):
     def __init__(self, port: int, session: dict) -> None:
         self.session = session
         self.calls: list[str] = []
+        # Status bodies the launcher reported, so a scenario can assert that a
+        # failing session was actually classified.
+        self.reports: list[dict] = []
         super().__init__(("127.0.0.1", port), ControlHandler)
 
 
@@ -209,6 +221,13 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self._json(self.server.session)  # type: ignore[attr-defined]
         elif self.path == "/launcher/heartbeat":
             self._json({"ok": True})
+        elif self.path == "/launcher/status":
+            length = int(self.headers.get("content-length") or 0)
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            # Both factors, exactly as the real control plane demands them.
+            assert self.headers.get("x-tunnel-secret")
+            self.server.reports.append(payload)  # type: ignore[attr-defined]
+            self._json({"ok": True, "applied": True, "status": payload.get("status")})
         else:
             self._json({"error": "not found"}, 404)
 

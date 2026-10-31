@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator
 
 from camoufox.async_api import AsyncCamoufox
 
+from core.lifecycle import mark
 from core.profile_manager import ProfileManager
 from core.proxy_inspector import ProxyGeoInfo, ProxyInspector
 from db.database import Database
@@ -69,7 +70,9 @@ class BrowserPool:
             geo: ProxyGeoInfo = await self._inspector.verify_and_inspect(profile_id)
             fingerprint = json.loads(profile["fingerprint_json"])
             self._profiles.browser_data_dir(profile_id).mkdir(parents=True, exist_ok=True)
-            await self._db.set_status(profile_id, "BUSY")
+            # A banned or still-cooling profile is not free to browse on a whim;
+            # the state machine refuses the jump instead of silently overwriting.
+            await mark(self._db, profile_id, "BUSY")
             self._active.add(profile_id)
             try:
                 proxy = _camoufox_proxy(profile["upstream_proxy_url"])
@@ -91,7 +94,12 @@ class BrowserPool:
                         page = await context.new_page()
                         await page.goto(start_url, wait_until="domcontentloaded")
                     yield context
-                await self._db.set_status(profile_id, "IDLE")
+                # Only un-set our own claim: something inside the context (a
+                # sync, a proxy kill) may already have set a status that outranks
+                # IDLE, and overwriting it would lose the signal.
+                latest = await self._db.get_profile(profile_id)
+                if latest and latest["status"] == "BUSY":
+                    await self._db.set_status(profile_id, "IDLE")
             except BaseException:
                 # Leave the row usable; PROXY_DEAD is already set by the inspector.
                 current = await self._db.get_profile(profile_id)

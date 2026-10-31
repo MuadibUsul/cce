@@ -57,6 +57,16 @@ cannot drift apart silently.
 - **Native profile isolation.** Each account gets its own `CLAUDE_CONFIG_DIR`
   (`~/.claude-box/profiles/<id>/.claude`, `0700`), wiped after exit unless
   `--keep`.
+- **A status is a permission, not a label.** `IDLE / BUSY / COOLDOWN /
+  AUTH_EXPIRED / PROXY_DEAD / BANNED` move through an explicit transition table
+  (`server/core/lifecycle.py`); an illegal jump is refused instead of written.
+  Cooldowns carry a `cooldown_until` deadline and a server-side sweeper frees
+  them when it passes, so a `kill -9`ed launcher cannot park an account forever.
+- **Failure is reported, not guessed.** The gateway is a blind TLS splice and
+  never sees an HTTP status inside the tunnel, so the launcher — the only party
+  that sees the CLI exit — classifies it and `POST /launcher/status` marks
+  `AUTH_EXPIRED` or starts a `COOLDOWN`. A successful `sync-credentials` clears
+  `AUTH_EXPIRED` by itself.
 - **No plaintext credentials on disk.** The store is AES-GCM sealed on the
   server, delivered over the tunnel, and extracted atomically into
   `<configDir>.incoming` before the swap. The blob is sealed *and* opened with
@@ -98,9 +108,41 @@ Requires Go 1.22+ and Python 3.11+.
 ```
 python -m venv .venv && .venv/bin/pip install -e "server[dev]"
 make all          # cross-compiles client-launcher + gateway for 4 platforms
+make dist-check   # asserts claude-box-<os>-<arch> names and the kernel default
 make check        # gofmt + go vet + go test
 .venv/bin/python -m pytest -q
 ```
+
+Artefacts are named `claude-box-<os>-<arch>` (`x64`/`arm64`). The desktop kernel
+URL is baked in at link time via `KERNEL_URL` (default
+`https://cdn.veynod.com/kernel/camoufox`), so a downloaded binary bootstraps
+itself; `CCE_KERNEL_URL` still overrides it at runtime.
+
+## MCP surface
+
+`server/mcp_server.py` is the orchestrator front door. Tool names are a contract
+(SPEC 4.6) and are asserted by `tests/test_mcp.py`:
+
+```
+create_isolated_profile(profile_id, local_proxy_port, upstream_proxy_url,
+                        expected_ip, os_type, batch_id)
+verify_profile_stealth(profile_id)
+issue_customer_card_key(profile_id, plan_tier, valid_days)
+```
+
+plus `create_account_batch`, `preflight_profile`, `sync_credentials`,
+`scrub_cache`, `reload_relay`, `fleet_status`, and the read-only resources
+`veynod://knowledge/cluster-spec`, `.../cluster-ops`, `.../cluster-architecture`.
+
+## Status reporting
+
+The launcher posts `{"status": "AUTH_EXPIRED" | "COOLDOWN" | "PROXY_DEAD" |
+"IDLE", ...}` to `/launcher/status` after the CLI exits. `AUTH_EXPIRED` comes
+from a 401/403/`invalid_grant`/`not logged in` message, `COOLDOWN` from a 429 or
+a usage-limit line (with a `try again in <n> <unit>` hint, floored at 30 min).
+A clean exit reports `IDLE`; a Ctrl-C reports nothing. Operators can override
+with `POST /admin/profiles/{id}/status` or free a stuck row with
+`POST /admin/profiles/{id}/release`.
 
 ## Run
 
@@ -165,6 +207,7 @@ residential relay and a TLS origin that answers as `ipinfo.io`/`ip-api.com`/
 .venv/bin/python tests/e2e/run_cli.py                        # happy path
 E2E_EXPECTED=198.51.100.4 .venv/bin/python tests/e2e/run_cli.py   # IP drift aborts
 E2E_DEAD_RELAY=1 .venv/bin/python tests/e2e/run_cli.py      # dead exit aborts
+E2E_AUTH_EXPIRED=1 .venv/bin/python tests/e2e/run_cli.py    # 401 reported as AUTH_EXPIRED
 CCE_RUNTIME=<camoufox bundle> .venv/bin/python tests/e2e/run_desktop.py
 ```
 
@@ -173,8 +216,10 @@ sing-box port map, real gateway, real `claude`. It needs an upstream SOCKS proxy
 in `CCE_UPSTREAM` (default `socks5://127.0.0.1:12080`) and checks the exit IP, the
 `api.anthropic.com` status through the tunnel, and the CLI itself.
 
-The desktop harness asserts the browser presents the stored UA, `Accept-Language`
-and timezone offset. It imports a throwaway CA with `certutil` first, because
+The happy path also asserts the session is reported as `IDLE`; the auth scenario
+asserts a failing CLI reaches the control plane as `AUTH_EXPIRED` rather than
+being lost. The desktop harness asserts the browser presents the stored UA,
+`Accept-Language` and timezone offset. It imports a throwaway CA with `certutil` first, because
 Firefox validates against NSS rather than `SSL_CERT_FILE`.
 
 ## Notes for operators

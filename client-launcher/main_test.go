@@ -693,3 +693,215 @@ func atoi(value string) int {
 	}
 	return number
 }
+
+// -- exit classification ---------------------------------------------------
+
+func TestClassifyRunAuthFailures(t *testing.T) {
+	for _, stderr := range []string{
+		"API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}",
+		"Invalid API key · Please run /login",
+		"You are not logged in.",
+		"OAuth token has been revoked",
+		"API Error: 403 Forbidden",
+	} {
+		if got := classifyRun(1, stderr).status; got != statusAuthExpired {
+			t.Errorf("classifyRun(%q) = %q, want %q", stderr, got, statusAuthExpired)
+		}
+	}
+}
+
+func TestClassifyRunUsageLimitUsesResetHint(t *testing.T) {
+	got := classifyRun(1, "API Error: 429 rate_limit_error — try again in 2 hours")
+	if got.status != statusCooldown {
+		t.Fatalf("status = %q, want %q", got.status, statusCooldown)
+	}
+	if got.cooldown != 2*time.Hour {
+		t.Errorf("cooldown = %v, want 2h", got.cooldown)
+	}
+}
+
+func TestClassifyRunUsageLimitFallsBackToFloor(t *testing.T) {
+	got := classifyRun(1, "Claude usage limit reached")
+	if got.cooldown != cooldownFloor {
+		t.Errorf("cooldown = %v, want the %v floor", got.cooldown, cooldownFloor)
+	}
+}
+
+func TestClassifyRunQuietCases(t *testing.T) {
+	cases := map[string]struct {
+		code   int
+		stderr string
+	}{
+		"ctrl-c":         {130, "interrupted"},
+		"never started":  {-1, "exec: not found"},
+		"unrelated fail": {1, "something odd happened"},
+	}
+	for name, c := range cases {
+		if got := classifyRun(c.code, c.stderr); got.status != "" {
+			t.Errorf("%s: status = %q, want silence", name, got.status)
+		}
+	}
+}
+
+func TestClassifyRunCleanExitBeatsAuthText(t *testing.T) {
+	// A successful run that merely mentions a token must not look expired.
+	if got := classifyRun(0, "Refreshed oauth token").status; got != statusIdle {
+		t.Errorf("status = %q, want %q", got, statusIdle)
+	}
+}
+
+func TestClassifyRunProxyFailure(t *testing.T) {
+	if got := classifyRun(1, "proxyconnect tcp: dial tcp 127.0.0.1:9: connect: connection refused").status; got != "PROXY_DEAD" {
+		t.Errorf("status = %q, want PROXY_DEAD", got)
+	}
+}
+
+func TestTailBufferKeepsTheEnd(t *testing.T) {
+	tail := &tailBuffer{limit: 8}
+	_, _ = tail.Write([]byte("0123456789abcdef"))
+	if got := tail.String(); got != "89abcdef" {
+		t.Errorf("tail = %q", got)
+	}
+}
+
+func TestReportStatusSendsBothFactors(t *testing.T) {
+	var gotBearer, gotSecret, gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBearer = r.Header.Get("authorization")
+		gotSecret = r.Header.Get("x-tunnel-secret")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := &apiClient{base: server.URL, key: "card_abc", secret: "tun_xyz",
+		http: &http.Client{Timeout: 5 * time.Second}}
+	if err := client.reportStatus(context.Background(), statusAuthExpired, "401", 0); err != nil {
+		t.Fatalf("reportStatus: %v", err)
+	}
+	if gotBearer != "Bearer card_abc" || gotSecret != "tun_xyz" {
+		t.Errorf("factors = %q / %q", gotBearer, gotSecret)
+	}
+	if !strings.Contains(gotBody, statusAuthExpired) {
+		t.Errorf("body = %q", gotBody)
+	}
+	if strings.Contains(gotBody, "cooldown_seconds") {
+		t.Errorf("cooldown sent when zero: %q", gotBody)
+	}
+}
+
+func TestReportStatusSurvivesCancelledSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := &apiClient{base: server.URL, key: "k", secret: "s",
+		http: &http.Client{Timeout: 5 * time.Second}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the session is already gone
+	if err := client.reportStatus(ctx, statusIdle, "", 0); err != nil {
+		t.Fatalf("reportStatus on dead context: %v", err)
+	}
+}
+
+func TestReportIsSkippedWithoutSecret(t *testing.T) {
+	hit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+	}))
+	defer server.Close()
+
+	client := &apiClient{base: server.URL, key: "k", http: &http.Client{Timeout: 5 * time.Second}}
+	client.report(context.Background(), outcome{status: statusIdle})
+	if hit {
+		t.Error("reported before a session existed")
+	}
+}
+
+// -- kernel bootstrap ------------------------------------------------------
+
+func TestEnsureKernelRefusesWithoutSource(t *testing.T) {
+	defer func(previous string) { kernelURLDefault = previous }(kernelURLDefault)
+	kernelURLDefault = ""
+	t.Setenv("CCE_KERNEL_URL", "")
+	dir := t.TempDir()
+
+	_, err := ensureKernel(dir)
+	if err == nil {
+		t.Fatal("expected an error when no kernel can be found or fetched")
+	}
+	if !strings.Contains(err.Error(), "kernelURLDefault") {
+		// The operator has to learn how to bake the default in.
+		t.Errorf("error does not point at the build flag: %v", err)
+	}
+}
+
+func TestEnsureKernelPrefersAnExistingBinary(t *testing.T) {
+	defer func(previous string) { kernelURLDefault = previous }(kernelURLDefault)
+	// An unreachable default must not matter once the kernel is on disk.
+	kernelURLDefault = "http://127.0.0.1:1/nope.tar.gz"
+	dir := t.TempDir()
+
+	path := filepath.Join(dir, kernelBinaryName())
+	if err := os.WriteFile(path, []byte("kernel"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The kernel is only "present" when its manifest is there too.
+	if err := os.WriteFile(filepath.Join(dir, "properties.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ensureKernel(dir)
+	if err != nil {
+		t.Fatalf("ensureKernel: %v", err)
+	}
+	if got != path {
+		t.Errorf("path = %q, want %q", got, path)
+	}
+}
+
+func TestEnsureKernelFallsBackToTheBakedDefault(t *testing.T) {
+	defer func(previous string) { kernelURLDefault = previous }(kernelURLDefault)
+	t.Setenv("CCE_KERNEL_URL", "")
+
+	served := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		served = true
+		_, _ = w.Write([]byte("kernel"))
+	}))
+	defer server.Close()
+	kernelURLDefault = server.URL
+
+	path, err := ensureKernel(t.TempDir())
+	if err != nil {
+		t.Fatalf("ensureKernel: %v", err)
+	}
+	if !served {
+		t.Fatal("the baked default was not used")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("kernel not written: %v", err)
+	}
+}
+
+func TestEnvStillOverridesTheBakedDefault(t *testing.T) {
+	defer func(previous string) { kernelURLDefault = previous }(kernelURLDefault)
+	kernelURLDefault = "http://127.0.0.1:1/baked"
+
+	var asked string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = r.URL.Path
+		_, _ = w.Write([]byte("kernel"))
+	}))
+	defer server.Close()
+	t.Setenv("CCE_KERNEL_URL", server.URL+"/override")
+
+	if _, err := ensureKernel(t.TempDir()); err != nil {
+		t.Fatalf("ensureKernel: %v", err)
+	}
+	if asked != "/override" {
+		t.Errorf("fetched %q, want /override", asked)
+	}
+}

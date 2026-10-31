@@ -3,6 +3,7 @@
     .venv/bin/python tests/e2e/run_cli.py           # happy path
     E2E_EXPECTED=198.51.100.4 ... run_cli.py        # IP drift must abort
     E2E_DEAD_RELAY=1 ... run_cli.py                 # dead exit must abort
+    E2E_AUTH_EXPIRED=1 ... run_cli.py               # 401 must be reported back
 """
 
 from __future__ import annotations
@@ -64,6 +65,9 @@ def main() -> int:
     fake = os.path.join(os.environ.get("E2E_BIN", "/tmp/claude-cluster-engine-e2e"), "fake-claude")
     with open(fake, "w") as fh:
         fh.write('#!/bin/sh\necho "CLAUDE RAN dir=$CLAUDE_CONFIG_DIR proxy=$HTTPS_PROXY args=$*"\n')
+        if os.environ.get("E2E_AUTH_EXPIRED"):
+            # Shaped like the real CLI: the message carries the HTTP status.
+            fh.write('echo \'API Error: 401 {"type":"authentication_error"}\' >&2\nexit 1\n')
     os.chmod(fake, 0o755)
 
     wipe(PROFILE)
@@ -83,7 +87,18 @@ def main() -> int:
     print("control:", control.calls)
     # A run is only correct if the expected outcome was reached: happy path
     # launches Claude, the two failure modes abort before it.
-    want = 1 if os.environ.get("E2E_EXPECTED") or os.environ.get("E2E_DEAD_RELAY") else 0
+    # An auth failure still launched Claude, so it belongs to the "ran" group.
+    want = 1 if (os.environ.get("E2E_EXPECTED") or os.environ.get("E2E_DEAD_RELAY")) else 0
+    if os.environ.get("E2E_AUTH_EXPIRED"):
+        # Claude ran and failed; the loss must reach the control plane.
+        assert [r.get("status") for r in control.reports] == ["AUTH_EXPIRED"], control.reports
+        assert run.returncode == 0, run.returncode
+    elif want == 0:
+        # A clean session must be reported as IDLE, with both factors.
+        assert [r.get("status") for r in control.reports] == ["IDLE"], control.reports
+    else:
+        # The failure modes abort before Claude runs, so nothing is classified.
+        assert control.reports == [], control.reports
     launched = "CLAUDE RAN" in run.stdout
     ok = report(run, origin.seen) if want == 0 else run.returncode != 0
     assert launched == (want == 0), f"claude launched={launched}, expected {want == 0}"

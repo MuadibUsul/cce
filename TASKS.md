@@ -49,6 +49,29 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done · `[!]` blocked
 - [x] `POST /profiles/{id}/import-credentials` escape hatch
 - [ ] full OAuth completion against a live account (blocked: no Anthropic account here)
 
+## Phase 7 — production closure
+- [x] `server/core/lifecycle.py`: explicit status transition table for all six
+      states, `cooldown_until` arithmetic (clamped to 24 h), `IllegalTransition`.
+- [x] Server-side cooldown sweeper (`CCE_REAPER_INTERVAL`, default 30 s) plus a
+      startup sweep, so an expired `COOLDOWN` recovers to `IDLE` without a client.
+- [x] `/launcher/status` (both factors) for launcher judgement: `AUTH_EXPIRED`,
+      `COOLDOWN`, `PROXY_DEAD`, `IDLE`. An illegal late report is a 200 no-op.
+- [x] `save_credentials` clears `AUTH_EXPIRED` itself, so sync and import both
+      recover the row; a `BANNED` or running `COOLDOWN` is left alone.
+- [x] Launcher exit classifier (`classifyRun`, `tailBuffer`) + best-effort
+      report that survives a cancelled session.
+- [x] Operator escape hatches: `POST /admin/profiles/{id}/status` (forced) and
+      `/release`.
+- [x] MCP tool names aligned to SPEC 4.6 (`create_isolated_profile`,
+      `verify_profile_stealth`, `issue_customer_card_key`), with `local_proxy_port`
+      as an explicit parameter.
+- [x] `veynod://knowledge/cluster-spec` plus `cluster-ops` and
+      `cluster-architecture` resources, asserted by tests.
+- [x] Compile-time `kernelURLDefault` fallback; desktop mode no longer requires
+      `CCE_KERNEL_URL` to be exported.
+- [x] `claude-box-<os>-<arch>` artefact naming in `Makefile`, `make dist-check`
+      asserting names and the baked default, and e2e building the released name.
+
 ## Known limits
 - hCaptcha is reachable and clickable, but from a **datacenter** exit it escalates
   from the checkbox to an image puzzle and the token stays empty. Everything up
@@ -70,6 +93,9 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done · `[!]` blocked
 - Firefox validates against NSS: a test CA has to be imported with `certutil`,
   and a self-signed leaf that is also `CA:TRUE` is rejected — use a real CA.
 - `api.ipify.org` is not whitelisted; the probe fallback is `ip-api.com` over HTTP.
+- A blind TLS splice cannot see HTTP status, so `AUTH_EXPIRED` is only as good
+  as the CLI's stderr wording; the classifier is deliberately quiet on unknown
+  failures rather than guessing a `COOLDOWN`.
 - The hCaptcha checkbox lives in a *nested* hCaptcha frame, and identically
   titled frames make name-based locators ambiguous — walk indices instead.
 - A script in `/tmp` named `click.py` shadows the PyPI `click` package (since

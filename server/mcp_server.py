@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -51,15 +52,19 @@ async def _services_ready() -> dict[str, Any]:
 
 
 @mcp.tool(description="Create a payment batch (max N accounts, shared BIN/country).")
-async def create_batch(batch_id: str, bin_prefix: str, billing_country: str, max_accounts: int = 10) -> dict[str, Any]:
+async def create_account_batch(batch_id: str, bin_prefix: str, billing_country: str, max_accounts: int = 10) -> dict[str, Any]:
     services = await _services_ready()
     await services["db"].create_batch(batch_id, bin_prefix, billing_country.upper(), max_accounts)
     return {"batch": await services["db"].get_batch(batch_id)}
 
 
-@mcp.tool(description="Create an isolated profile: frozen fingerprint, proxy port, frozen egress IP.")
-async def create_profile(
+@mcp.tool(
+    name="create_isolated_profile",
+    description="Create an isolated profile: frozen fingerprint, proxy port, frozen egress IP.",
+)
+async def create_isolated_profile(
     profile_id: str,
+    local_proxy_port: int | None,
     upstream_proxy_url: str,
     expected_ip: str,
     os_type: str = "macos",
@@ -68,6 +73,7 @@ async def create_profile(
     services = await _services_ready()
     record = await services["profiles"].create_profile(
         profile_id=profile_id,
+        local_proxy_port=local_proxy_port,
         upstream_proxy_url=upstream_proxy_url,
         expected_ip=expected_ip,
         os_type=os_type,
@@ -87,8 +93,11 @@ async def preflight_profile(profile_id: str) -> dict[str, Any]:
     return {"ok": True, "profile_id": profile_id, "geo": geo.to_json()}
 
 
-@mcp.tool(description="Launch the fingerprinted browser and compare observed values with the stored ones.")
-async def stealth_check(profile_id: str) -> dict[str, Any]:
+@mcp.tool(
+    name="verify_profile_stealth",
+    description="Open an IP echo page inside the fingerprinted browser and report fingerprint/IP consistency.",
+)
+async def verify_profile_stealth(profile_id: str) -> dict[str, Any]:
     services = await _services_ready()
     return await services["pool"].verify_stealth(profile_id)
 
@@ -118,8 +127,11 @@ async def reload_relay() -> dict[str, Any]:
     return await services["singbox"].reload()
 
 
-@mcp.tool(description="Issue a delivery card key + tunnel secret for a profile.")
-async def issue_key(profile_id: str, plan_tier: str = "pro", valid_days: int = 30) -> dict[str, Any]:
+@mcp.tool(
+    name="issue_customer_card_key",
+    description="Issue a delivery card key + tunnel secret for a profile.",
+)
+async def issue_customer_card_key(profile_id: str, plan_tier: str = "pro", valid_days: int = 30) -> dict[str, Any]:
     from datetime import datetime, timedelta, timezone
 
     services = await _services_ready()
@@ -166,3 +178,53 @@ def _public(row: dict[str, Any]) -> dict[str, Any]:
 
 if __name__ == "__main__":
     mcp.run()
+
+
+# -- knowledge resources ---------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+KNOWLEDGE: dict[str, Path] = {
+    "veynod://knowledge/cluster-spec": REPO_ROOT / "SPEC.md",
+    "veynod://knowledge/cluster-ops": REPO_ROOT / "docs" / "OPERATIONS_SOP.md",
+    "veynod://knowledge/cluster-architecture": REPO_ROOT / "docs" / "ARCHITECTURE.md",
+}
+
+
+def _knowledge(uri: str) -> str:
+    path = KNOWLEDGE[uri]
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # A packaged deployment may ship the server without the repo docs; an
+        # empty read is friendlier to an orchestrator than a hard failure.
+        return f"# {uri}\n\nDocument not present at {path}.\n"
+
+
+@mcp.resource(
+    "veynod://knowledge/cluster-spec",
+    name="cluster-spec",
+    description="The system specification: invariants, module contracts, phases.",
+    mime_type="text/markdown",
+)
+def cluster_spec() -> str:
+    return _knowledge("veynod://knowledge/cluster-spec")
+
+
+@mcp.resource(
+    "veynod://knowledge/cluster-ops",
+    name="cluster-ops",
+    description="Operating procedure: provisioning, credential sync, incident runbook.",
+    mime_type="text/markdown",
+)
+def cluster_ops() -> str:
+    return _knowledge("veynod://knowledge/cluster-ops")
+
+
+@mcp.resource(
+    "veynod://knowledge/cluster-architecture",
+    name="cluster-architecture",
+    description="Architecture and threat model, for review and onboarding.",
+    mime_type="text/markdown",
+)
+def cluster_architecture() -> str:
+    return _knowledge("veynod://knowledge/cluster-architecture")

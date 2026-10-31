@@ -41,6 +41,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -60,9 +61,24 @@ const (
 
 	defaultGatewayPort = 8443
 	stateDirName       = ".claude-box"
+
+	// reportTimeout bounds a status report; it runs after the session context
+	// may already be cancelled.
+	reportTimeout = 10 * time.Second
+	// cooldownFloor is used when a usage-limit message carries no reset hint.
+	cooldownFloor = 30 * time.Minute
 )
 
 var version = "dev"
+
+// kernelURLDefault is baked in at build time so a customer binary works with no
+// environment at all:
+//
+//	go build -ldflags "-X main.kernelURLDefault=https://cdn.example/kernel.tar.gz"
+//
+// An empty value is legal and means "ship the kernel alongside the binary"; the
+// launcher then says so instead of fetching.
+var kernelURLDefault = ""
 
 // session is the subset of /launcher/session the launcher acts on.
 type session struct {
@@ -193,6 +209,9 @@ func main() {
 	if err != nil {
 		fail("%v", err)
 	}
+	// Status reports are authenticated with both factors, so the client needs
+	// the secret as soon as the session exists.
+	client.secret = sess.Tunnel.Secret
 	if *gateway != "" {
 		host, port, splitErr := net.SplitHostPort(*gateway)
 		if splitErr != nil {
@@ -242,7 +261,10 @@ func main() {
 type apiClient struct {
 	base string
 	key  string
-	http *http.Client
+	// secret is the tunnel secret echoed on status reports; it is issued by
+	// /launcher/session, so it is filled in once a session exists.
+	secret string
+	http   *http.Client
 }
 
 func newAPIClient(host, key string) (*apiClient, error) {
@@ -323,6 +345,66 @@ func (c *apiClient) heartbeat(ctx context.Context, observed string) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+// credentialFailure reports the vocabulary the control plane's state machine
+// understands. Anything else is refused there, so the two must stay in step.
+const (
+	statusAuthExpired = "AUTH_EXPIRED"
+	statusCooldown    = "COOLDOWN"
+	statusIdle        = "IDLE"
+)
+
+// reportStatus tells the control plane how the session ended.
+//
+// The gateway is a blind TLS splice: it never sees the HTTP status inside the
+// tunnel, so an expired token or a hit usage limit is invisible to the server
+// unless the launcher — the only party that sees the CLI's exit — says so. The
+// report is best-effort: a session that ran fine is not failed because the
+// network dropped while filing the paperwork.
+func (c *apiClient) reportStatus(ctx context.Context, state, reason string, cooldown time.Duration) error {
+	payload := map[string]any{"status": state}
+	if reason != "" {
+		payload["reason"] = truncate(reason, 190)
+	}
+	if cooldown > 0 {
+		payload["cooldown_seconds"] = int(cooldown.Seconds())
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	// The session context may already be cancelled by the time we report, so
+	// the report gets its own deadline.
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
+	defer cancel()
+
+	request, err := http.NewRequestWithContext(reportCtx, http.MethodPost, c.base+"/launcher/status", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("authorization", "Bearer "+c.key)
+	request.Header.Set("x-tunnel-secret", c.secret)
+	request.Header.Set("content-type", "application/json")
+
+	resp, err := c.http.Do(request)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("status report refused: %s", resp.Status)
+	}
+	return nil
+}
+
+func truncate(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
 }
 
 // -- loopback proxy --------------------------------------------------------
@@ -533,8 +615,13 @@ func runCLI(ctx context.Context, client *apiClient, sess *session, root string, 
 		return fmt.Errorf("claude binary not found (%s); install the Claude CLI first", claudeBin)
 	}
 
+	tail := &tailBuffer{limit: 4096}
+
 	cmd := exec.CommandContext(ctx, binary, claudeArgs...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Stdin, cmd.Stdout = os.Stdin, os.Stdout
+	// The CLI still writes to the console, but stderr is teed so the exit can
+	// be classified afterwards.
+	cmd.Stderr = io.MultiWriter(os.Stderr, tail)
 	cmd.Env = append(os.Environ(),
 		"CLAUDE_CONFIG_DIR="+configDir,
 		"HTTPS_PROXY="+proxy.URL(),
@@ -544,7 +631,144 @@ func runCLI(ctx context.Context, client *apiClient, sess *session, root string, 
 		"TZ="+firstNonEmpty(sess.Geo.Timezone, "UTC"),
 		"NO_PROXY=localhost,127.0.0.1",
 	)
-	return cmd.Run()
+	runErr := cmd.Run()
+	var exitErr *exec.ExitError
+	code := 0
+	if errors.As(runErr, &exitErr) {
+		code = exitErr.ExitCode()
+		runErr = nil
+	} else if runErr != nil {
+		code = -1
+	}
+	client.report(ctx, classifyRun(code, tail.String()))
+	return runErr
+}
+
+// outcome is one launcher judgement about a finished session.
+type outcome struct {
+	status string
+	reason string
+	// cooldown is sent only for a usage-limit hit, and scaled by plan tier:
+	// a 20x account that hits its cap needs hours, not minutes.
+	cooldown time.Duration
+}
+
+func (c *apiClient) report(ctx context.Context, result outcome) {
+	if result.status == "" || c.secret == "" {
+		return
+	}
+	if err := c.reportStatus(ctx, result.status, result.reason, result.cooldown); err != nil {
+		log.Printf("warning: could not report session status: %v", err)
+	}
+}
+
+// classifyRun turns an exit code and the tail of stderr into a status.
+//
+// The CLI signals an expired or rejected token with the HTTP status in the
+// message, and a hit usage limit with a 429. A bare Ctrl-C is not a fault and
+// must not park the account. Unknown failures stay silent rather than guessing:
+// a wrong COOLDOWN costs the fleet more than a missing one.
+func classifyRun(code int, stderr string) outcome {
+	haystack := strings.ToLower(stderr)
+	switch {
+	case isUsageLimit(haystack):
+		return outcome{status: statusCooldown, reason: "usage limit", cooldown: cooldownFromLimit(stderr)}
+	case isAuthFailure(haystack):
+		return outcome{status: statusAuthExpired, reason: firstLineOf(stderr)}
+	case code == 0:
+		return outcome{status: statusIdle}
+	case code == 130 || code == -1:
+		// Interrupted or never started: nothing to conclude.
+		return outcome{}
+	case isProxyFailure(haystack):
+		return outcome{status: "PROXY_DEAD", reason: firstLineOf(stderr)}
+	default:
+		return outcome{}
+	}
+}
+
+func isAuthFailure(lower string) bool {
+	markers := []string{
+		"401", "403", "unauthorized", "invalid_api_key", "invalid api key",
+		"authentication_error", "authentication failed", "please log in",
+		"not logged in", "logged out", "token expired", "invalid_grant",
+		"oauth token has been revoked", "credit balance is too low",
+	}
+	return containsAny(lower, markers)
+}
+
+func isUsageLimit(lower string) bool {
+	markers := []string{"429", "usage limit", "rate limit", "rate_limit_error",
+		"too many requests", "reached your limit", "limit reached"}
+	return containsAny(lower, markers)
+}
+
+func isProxyFailure(lower string) bool {
+	markers := []string{"proxyconnect", "connection refused", "econnrefused",
+		"proxy unreachable", "tunnel secret", "cannot read egress ip"}
+	return containsAny(lower, markers)
+}
+
+func containsAny(haystack string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(haystack, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// cooldownFromLimit reads a "resets at 3pm" / "try again in 4h" hint and
+// falls back to the floor. The value is clamped by the control plane too.
+func cooldownFromLimit(stderr string) time.Duration {
+
+	re := regexp.MustCompile(`(?i)(?:try again in|resets in|retry in)\s+(\d+)\s*(second|minute|hour|day)s?`)
+	hit := re.FindStringSubmatch(stderr)
+	if hit == nil {
+		return cooldownFloor
+	}
+	count, err := strconv.Atoi(hit[1])
+	if err != nil || count <= 0 {
+		return cooldownFloor
+	}
+	unit := map[string]time.Duration{
+		"second": time.Second, "minute": time.Minute,
+		"hour": time.Hour, "day": 24 * time.Hour,
+	}[strings.ToLower(hit[2])]
+	return time.Duration(count) * unit
+}
+
+func firstLineOf(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return truncate(trimmed, 190)
+		}
+	}
+	return ""
+}
+
+// tailBuffer keeps the last `limit` bytes written to it.
+type tailBuffer struct {
+	mu    sync.Mutex
+	limit int
+	data  []byte
+}
+
+func (t *tailBuffer) Write(chunk []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.data = append(t.data, chunk...)
+	if len(t.data) > t.limit {
+		// Keep the tail only: the reason is printed just before the exit.
+		t.data = t.data[len(t.data)-t.limit:]
+	}
+	return len(chunk), nil
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.data)
 }
 
 // refreshCredentials downloads and unpacks the encrypted credential archive
@@ -896,9 +1120,9 @@ func ensureKernel(runtimeDir string) (string, error) {
 		return path, nil
 	}
 
-	source := envOr("CCE_KERNEL_URL", "")
+	source := envOr("CCE_KERNEL_URL", kernelURLDefault)
 	if source == "" {
-		return "", fmt.Errorf("browser kernel missing in %s (set CCE_KERNEL_URL to fetch it)", runtimeDir)
+		return "", fmt.Errorf("browser kernel missing in %s (set CCE_KERNEL_URL, or build with -X main.kernelURLDefault=...)", runtimeDir)
 	}
 	log.Printf("downloading browser kernel from %s", source)
 	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
@@ -1113,7 +1337,8 @@ Environment:
   CCE_HOST          default for --host
   CCE_GATEWAY       gateway host:port override
   CCE_TUNNEL_CA     PEM bundle to trust for the gateway (self-hosted/pinned)
-  CCE_KERNEL_URL    where desktop mode fetches the browser kernel
+  CCE_KERNEL_URL    where desktop mode fetches the browser kernel (baked-in
+                    default applies when the binary was built with one)
   CCE_HEADLESS      run desktop mode without a display (hosted boxes)
   CCE_EXTRA_PREFS   JSON object of extra Firefox prefs for desktop mode
   CCE_TUNNEL_CERT   gateway certificate (server side, same variable name)

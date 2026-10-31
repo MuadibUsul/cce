@@ -186,8 +186,18 @@ class Database:
             return None
 
     async def save_credentials(self, profile_id: str, blob: bytes) -> None:
+        """Store a fresh credential blob and consider the auth problem solved.
+
+        Clearing `AUTH_EXPIRED` here (rather than at every caller) means the
+        sync path and the import path both recover the row, and a caller cannot
+        forget. A cooldown or a ban outranks a fresh blob and is left alone.
+        """
         await self.execute(
-            "UPDATE profiles SET claude_credentials_enc = ?, status = 'IDLE' WHERE profile_id = ?",
+            "UPDATE profiles SET claude_credentials_enc = ?,"
+            " status = CASE WHEN status IN ('AUTH_EXPIRED', 'IDLE') THEN 'IDLE' ELSE status END,"
+            " cooldown_until = CASE WHEN status IN ('AUTH_EXPIRED', 'IDLE') THEN NULL"
+            " ELSE cooldown_until END"
+            " WHERE profile_id = ?",
             (blob, profile_id),
         )
 

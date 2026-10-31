@@ -12,6 +12,7 @@ routes take the card key as a bearer token so a leaked URL alone is not enough.
 from __future__ import annotations
 
 import base64
+import asyncio
 import os
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,8 @@ from pydantic import BaseModel, Field
 
 from core.browser_pool import BrowserPool
 from core.crypto import CryptoError, decrypt_blob
+from core.lifecycle import COOLDOWN, IllegalTransition, cooldown_until, release_due_cooldowns
+from core.lifecycle import mark as mark_status
 from core.profile_manager import ProfileError, ProfileManager
 from core.proxy_inspector import ProxyKillSwitchError, ProxyInspector
 from core.singbox_manager import SingBoxError, SingBoxManager
@@ -35,6 +38,8 @@ TUNNEL_HOST = os.environ.get("CCE_TUNNEL_HOST", "")
 TUNNEL_PORT = int(os.environ.get("CCE_TUNNEL_PORT", "8443"))
 # Where issued tunnel secrets are mirrored for the gateway (CCE_TUNNEL_SECRETS).
 SECRETS_PATH = os.environ.get("CCE_TUNNEL_SECRETS", "")
+# Seconds between cooldown sweeps. Zero disables the task (tests drive it by hand).
+REAPER_INTERVAL = float(os.environ.get("CCE_REAPER_INTERVAL", "30"))
 
 
 class ProfileCreate(BaseModel):
@@ -63,6 +68,14 @@ class KeyIssue(BaseModel):
     valid_days: int = Field(default=30, ge=1, le=365)
 
 
+class StatusReport(BaseModel):
+    """A launcher's judgement about the session it just ran."""
+
+    status: str = Field(pattern=r"^(IDLE|BUSY|AUTH_EXPIRED|COOLDOWN|PROXY_DEAD|BANNED)$")
+    reason: str | None = Field(default=None, max_length=200)
+    cooldown_seconds: int | None = Field(default=None, ge=0, le=86400)
+
+
 class State:
     """Process-wide wiring, populated on startup."""
 
@@ -71,6 +84,7 @@ class State:
     inspector: ProxyInspector
     pool: BrowserPool
     singbox: SingBoxManager
+    reaper: asyncio.Task[None] | None = None
 
 
 state = State()
@@ -127,11 +141,36 @@ def create_app() -> FastAPI:
         state.singbox = SingBoxManager()
         state.pool = BrowserPool(state.db, state.profiles, state.inspector)
         await _restore_routes()
+        await release_due_cooldowns(state.db)
+        if REAPER_INTERVAL > 0:
+            state.reaper = asyncio.create_task(_reaper(REAPER_INTERVAL))
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        if state.reaper is not None:
+            state.reaper.cancel()
+            try:
+                await state.reaper
+            except asyncio.CancelledError:
+                pass
+            state.reaper = None
         await state.singbox.stop()
         await state.db.close()
+
+    async def _reaper(interval: float) -> None:
+        """Free cooldowns that have run out.
+
+        Runs on the server because only the server may write status; a launcher
+        that is `kill -9`ed can never report its own recovery.
+        """
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await release_due_cooldowns(state.db)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a bad sweep must not kill the loop
+                pass
 
     async def _restore_routes() -> None:
         """Rebuild the port map from the database, then bring sing-box back up.
@@ -218,6 +257,26 @@ def create_app() -> FastAPI:
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "profile not found")
         return _public_profile(row)
+
+    @app.post("/admin/profiles/{profile_id}/status", dependencies=[admin])
+    async def set_profile_status(profile_id: str, body: StatusReport) -> dict[str, Any]:
+        """Operator override. Bypasses the transition table."""
+        if await state.db.get_profile(profile_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "profile not found")
+        until = None
+        if body.status == "COOLDOWN":
+            span = body.cooldown_seconds
+            until = cooldown_until(COOLDOWN if span is None else timedelta(seconds=span))
+        await mark_status(state.db, profile_id, body.status, until=until, force=True)
+        return {"profile_id": profile_id, "status": body.status, "cooldown_until": until}
+
+    @app.post("/admin/profiles/{profile_id}/release", dependencies=[admin])
+    async def release_profile(profile_id: str) -> dict[str, Any]:
+        """Free a row by hand: a stale BUSY after a killed launcher, a cooldown."""
+        if await state.db.get_profile(profile_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "profile not found")
+        await mark_status(state.db, profile_id, "IDLE", force=True)
+        return {"profile_id": profile_id, "status": "IDLE"}
 
     @app.post("/admin/profiles/{profile_id}/preflight", dependencies=[admin])
     async def preflight(profile_id: str) -> dict[str, Any]:
@@ -330,6 +389,32 @@ def create_app() -> FastAPI:
         if drift:
             await state.db.set_status(row["profile_id"], "PROXY_DEAD")
         return {"ok": True, "ip_drift": drift, "expected_ip": row["expected_ip"]}
+
+    @app.post("/launcher/status")
+    async def launcher_status(
+        body: StatusReport,
+        row: Annotated[dict[str, Any], Depends(_launcher_key)],
+    ) -> dict[str, Any]:
+        """Take the launcher's word about how the session ended.
+
+        The gateway is a blind TLS splice, so an expired token or a usage limit
+        is invisible to it -- and to this server. The launcher is the only party
+        that can see the CLI's exit, so it reports, and the state machine decides
+        whether the claim is legal. `IDLE` means "ran fine".
+        """
+        profile_id = row["profile_id"]
+        until = None
+        if body.status == "COOLDOWN":
+            span = body.cooldown_seconds
+            until = cooldown_until(
+                COOLDOWN if span is None else timedelta(seconds=span)
+            )
+        try:
+            current = await mark_status(state.db, profile_id, body.status, until=until)
+        except IllegalTransition as exc:
+            # A late report from a session that already moved on is not an error.
+            return {"ok": True, "applied": False, "status": exc.current, "reason": str(exc)}
+        return {"ok": True, "applied": True, "status": current, "cooldown_until": until}
 
     # -- debug -------------------------------------------------------------
 

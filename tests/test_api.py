@@ -216,6 +216,19 @@ async def test_revoked_key_rejected(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def _launcher_headers(client: httpx.AsyncClient, profile_id: str = "acct-api") -> dict[str, str]:
+    """Both factors, as the launcher sends them."""
+    key = (
+        await client.post(
+            "/admin/keys", headers=admin(), json={"profile_id": profile_id, "plan_tier": "pro"}
+        )
+    ).json()
+    return {
+        "authorization": f"Bearer {key['card_key']}",
+        "x-tunnel-secret": key["tunnel_secret"],
+    }
+
+
 async def test_heartbeat_flags_ip_drift(client: httpx.AsyncClient) -> None:
     await _create_profile(client)
     key = (
@@ -285,3 +298,83 @@ async def test_routes_are_rebuilt_from_the_database_on_startup(tmp_path, monkeyp
         finally:
             for handler in second.router.on_shutdown:
                 await handler()
+
+
+@pytest.mark.asyncio
+async def test_launcher_reports_auth_expiry(client: httpx.AsyncClient) -> None:
+    """The gateway cannot see HTTP status, so this report is the only trigger."""
+    await _create_profile(client)
+    headers = await _launcher_headers(client)
+
+    body = (
+        await client.post(
+            "/launcher/status",
+            headers=headers,
+            json={"status": "AUTH_EXPIRED", "reason": "API Error: 401"},
+        )
+    ).json()
+
+    assert body["applied"] is True
+    profile = (await client.get("/admin/profiles/acct-api", headers=admin())).json()
+    assert profile["status"] == "AUTH_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_launcher_reports_a_cooldown_deadline(client: httpx.AsyncClient) -> None:
+    await _create_profile(client)
+    body = (
+        await client.post(
+            "/launcher/status",
+            headers=await _launcher_headers(client),
+            json={"status": "COOLDOWN", "reason": "usage limit", "cooldown_seconds": 7200},
+        )
+    ).json()
+
+    assert body["applied"] is True
+    profile = (await client.get("/admin/profiles/acct-api", headers=admin())).json()
+    assert profile["status"] == "COOLDOWN"
+    assert profile["cooldown_until"] is not None
+
+
+@pytest.mark.asyncio
+async def test_illegal_launcher_report_is_not_an_error(client: httpx.AsyncClient) -> None:
+    """A late report from a session that already moved on is a no-op."""
+    await _create_profile(client)
+    headers = await _launcher_headers(client)
+    await client.post("/admin/profiles/acct-api/status", headers=admin(), json={"status": "BANNED"})
+
+    response = await client.post("/launcher/status", headers=headers, json={"status": "BUSY"})
+
+    assert response.status_code == 200
+    assert response.json()["applied"] is False
+    assert response.json()["status"] == "BANNED"
+
+
+@pytest.mark.asyncio
+async def test_status_report_needs_the_tunnel_secret(client: httpx.AsyncClient) -> None:
+    await _create_profile(client)
+    headers = await _launcher_headers(client)
+    del headers["x-tunnel-secret"]
+    response = await client.post("/launcher/status", headers=headers, json={"status": "IDLE"})
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_unknown_status_is_refused(client: httpx.AsyncClient) -> None:
+    await _create_profile(client)
+    response = await client.post(
+        "/launcher/status", headers=await _launcher_headers(client), json={"status": "SLEEPING"}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_admin_release_frees_a_stuck_row(client: httpx.AsyncClient) -> None:
+    await _create_profile(client)
+    await client.post(
+        "/admin/profiles/acct-api/status", headers=admin(), json={"status": "COOLDOWN"}
+    )
+    body = (await client.post("/admin/profiles/acct-api/release", headers=admin())).json()
+    assert body["status"] == "IDLE"
+    profile = (await client.get("/admin/profiles/acct-api", headers=admin())).json()
+    assert profile["status"] == "IDLE"
