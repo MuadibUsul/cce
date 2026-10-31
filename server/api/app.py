@@ -126,11 +126,28 @@ def create_app() -> FastAPI:
         state.inspector = ProxyInspector(state.db)
         state.singbox = SingBoxManager()
         state.pool = BrowserPool(state.db, state.profiles, state.inspector)
+        await _restore_routes()
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         await state.singbox.stop()
         await state.db.close()
+
+    async def _restore_routes() -> None:
+        """Rebuild the port map from the database, then bring sing-box back up.
+
+        The map is in-memory state, so a restart would otherwise leave every
+        profile reachable in the records but with no inbound to reach it -- and
+        `/admin/singbox/reload` refuses to render an empty map.
+        """
+        for row in await state.db.list_profiles():
+            state.singbox.register(row["profile_id"], row["local_proxy_port"], row["upstream_proxy_url"])
+        if state.singbox.available:
+            try:
+                await state.singbox.reload()
+            except SingBoxError:
+                # A foreign listener on one of the ports must not stop the API.
+                pass
 
     @app.exception_handler(ProxyKillSwitchError)
     async def _kill_switch(_request: Any, exc: ProxyKillSwitchError) -> JSONResponse:

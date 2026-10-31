@@ -530,6 +530,20 @@ func (w *whitelist) String() string {
 	return strings.Join(append(w.suffixes, keys(w.exact)...), ",")
 }
 
+// defaultDomains is the whole reachable surface.
+//
+// The Claude endpoints and the two IP echoes are required by design. `claude.com`
+// and `platform.claude.com` are here for sign-in: `claude auth login` prints a
+// `claude.com/cai/oauth/authorize` URL that 307s to `claude.ai/oauth/authorize`,
+// and the redirect_uri it carries is on `platform.claude.com`. Without both, a
+// customer behind the gateway can never reach the page that mints the token.
+func defaultDomains() []string {
+	return []string{
+		"*.anthropic.com", "*.claude.ai", "claude.com", "platform.claude.com",
+		"*.stripe.com", "*.cloudflare.com", "ipinfo.io", "ip-api.com",
+	}
+}
+
 func keys(m map[string]struct{}) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -546,7 +560,7 @@ func main() {
 	keyPath := flag.String("key", envOr("CCE_TUNNEL_KEY", "data/gateway/tls.key"), "TLS key matching --cert")
 	flag.Parse()
 
-	domains := []string{"*.anthropic.com", "*.claude.ai", "*.stripe.com", "*.cloudflare.com", "ipinfo.io", "ip-api.com"}
+	domains := defaultDomains()
 	if *domainsFlag != "" {
 		domains = strings.Split(*domainsFlag, ",")
 	}

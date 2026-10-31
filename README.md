@@ -25,12 +25,21 @@ Spec: `SPEC.md` · Ops: `docs/OPERATIONS_SOP.md` · Tasks: `TASKS.md`
    gateway/ (Go)  SNI + CONNECT whitelist, bearer secret, port routing
                    │
                    ▼
-   *.anthropic.com · *.claude.ai · *.stripe.com · *.cloudflare.com · ipinfo.io · ip-api.com
+   *.anthropic.com · *.claude.ai · claude.com · platform.claude.com
+   *.stripe.com · *.cloudflare.com · ipinfo.io · ip-api.com
 ```
 
 Everything outside that whitelist is refused at the gateway, so the browser and
 the Claude CLI can only ever talk to Claude and the IP echo services the kill
 switch needs.
+
+`claude.com` and `platform.claude.com` are the one addition beyond the original
+list, and they are load-bearing rather than decorative: `claude auth login`
+points the browser at `claude.com/cai/oauth/authorize`, and the callback that
+carries the authorization code belongs to `platform.claude.com`. Without both,
+no customer behind the gateway can ever reach the page that mints a token.
+`defaultDomains()` in `gateway/main.go` carries the same reasoning, so the two
+cannot drift apart silently.
 
 ## Guarantees
 
@@ -50,7 +59,37 @@ switch needs.
   `--keep`.
 - **No plaintext credentials on disk.** The store is AES-GCM sealed on the
   server, delivered over the tunnel, and extracted atomically into
-  `<configDir>.incoming` before the swap.
+  `<configDir>.incoming` before the swap. The blob is sealed *and* opened with
+  the profile id as AEAD associated data, so a swapped ciphertext cannot
+  authenticate as another account.
+
+## Getting credentials in
+
+`POST /profiles/{id}/sync-credentials` runs the real OAuth flow: it launches
+`claude auth login`, scrapes the authorization URL off its output, drives that
+URL in the profile's own browser, pastes the authorization code back on the
+CLI's stdin, then seals the resulting `.credentials.json` under the profile.
+
+`claude auth login` is used rather than `claude login` on purpose — the latter is
+a full-screen TUI that blocks forever on a non-tty.
+
+The page driving is deliberately honest about its limits. `_drive_consent`
+returns `None` instead of pretending success the moment it meets something only
+a person can answer (password, SSO, second factor), so a caller can tell a
+finished sync from a stalled one. Cloudflare is passed by the real kernel, not by
+a heuristic.
+
+One step is genuinely hard from a datacenter exit: the magic-link form is gated
+on an hCaptcha token, and hCaptcha serves that checkbox inside a *nested* frame
+that sits off-screen at `y = -9999` until the widget is scrolled to. `login.py`
+walks the iframes by index (`frame_locator(...).nth(i)` — the frames share a
+title, so any name-based locator is ambiguous) and clicks only the one carrying
+`#checkbox`; `_drive_consent` retries that up to three times. On a datacenter IP
+hCaptcha often still escalates to an image puzzle, which is where the run stops.
+
+When it does stall, `POST /profiles/{id}/import-credentials` is the documented
+escape hatch: sign in once by hand, drop the `.claude` directory on the server,
+and the same sealing, atomic swap and erase guarantees apply.
 
 ## Build
 

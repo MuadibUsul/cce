@@ -255,3 +255,33 @@ async def test_singbox_state_endpoint(client: httpx.AsyncClient) -> None:
     await _create_profile(client)
     body = (await client.get("/admin/singbox", headers=admin())).json()
     assert body["config"]["inbounds"][0]["listen_port"] >= 10001
+
+
+async def test_routes_are_rebuilt_from_the_database_on_startup(tmp_path, monkeypatch) -> None:
+    """A restart must not orphan profiles whose ports live only in memory."""
+    monkeypatch.setenv("CCE_ADMIN_TOKEN", ADMIN)
+    monkeypatch.setenv("CCE_MASTER_KEY", MASTER_KEY)
+    monkeypatch.setenv("CCE_DB_PATH", str(tmp_path / "restart.sqlite3"))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data" / "profiles").mkdir(parents=True, exist_ok=True)
+
+    first = create_app()
+    transport = httpx.ASGITransport(app=first)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        for handler in first.router.on_startup:
+            await handler()
+        await _create_profile(http)
+        for handler in first.router.on_shutdown:
+            await handler()
+
+    second = create_app()
+    transport = httpx.ASGITransport(app=second)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        for handler in second.router.on_startup:
+            await handler()
+        try:
+            body = (await http.get("/admin/singbox", headers=admin())).json()
+            assert [inbound["listen_port"] for inbound in body["config"]["inbounds"]] == [10001]
+        finally:
+            for handler in second.router.on_shutdown:
+                await handler()

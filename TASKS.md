@@ -39,6 +39,24 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done · `[!]` blocked
 - [x] end-to-end run against a real static residential IP (`claude-box cli --key test_001`)
 - [x] README + run instructions
 
+## Phase 6 — real OAuth `sync-credentials`
+- [x] `claude auth login` (streams the URL, reads a code) instead of the `claude login` TUI
+- [x] whitelist `claude.com` + `platform.claude.com`, without which no token can be minted
+- [x] `_read_authorize_url()` — line-by-line scrape, early exit if credentials appear
+- [x] `server/core/login.py` + `_drive_consent()` — email fill, nested-frame hCaptcha, consent, code paste-back
+- [x] blob sealed/opened with the profile as associated data on both sides
+- [x] routes rebuilt from the DB on control-plane restart (`_restore_routes`)
+- [x] `POST /profiles/{id}/import-credentials` escape hatch
+- [ ] full OAuth completion against a live account (blocked: no Anthropic account here)
+
+## Known limits
+- hCaptcha is reachable and clickable, but from a **datacenter** exit it escalates
+  from the checkbox to an image puzzle and the token stays empty. Everything up
+  to that point is proven; finishing needs either a residential exit or one
+  human answer. `import-credentials` is the documented bypass.
+- Phase 5 was verified over a Vultr datacenter IP, not a residential one, so the
+  residential claim in SPEC is exercised only by the harness relays.
+
 ## Findings worth keeping
 - Per-key tunnel secrets needed a gateway-side set, not one static value
   (`CCE_TUNNEL_SECRETS`, hot-reloaded).
@@ -52,3 +70,10 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done · `[!]` blocked
 - Firefox validates against NSS: a test CA has to be imported with `certutil`,
   and a self-signed leaf that is also `CA:TRUE` is rejected — use a real CA.
 - `api.ipify.org` is not whitelisted; the probe fallback is `ip-api.com` over HTTP.
+- The hCaptcha checkbox lives in a *nested* hCaptcha frame, and identically
+  titled frames make name-based locators ambiguous — walk indices instead.
+- A script in `/tmp` named `click.py` shadows the PyPI `click` package (since
+  `/tmp` leads `sys.path`), which cycles `camoufox -> click` and hangs the
+  browser launch. Renamed to `/tmp/drive_click.py`.
+- The sing-box route map is memory-only; a control-plane restart used to leave
+  profiles unroutable and `reload` refusing an empty map. Now rebuilt from the DB.

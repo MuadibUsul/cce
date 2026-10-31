@@ -154,12 +154,17 @@ class BrowserPool:
 
     # -- credential sync ---------------------------------------------------
 
-    async def sync_claude_cli_credentials(self, profile_id: str, *, timeout: float = 600.0) -> bytes:
-        """Run `claude login`, approve it inside the browser, archive + encrypt.
+    async def sync_claude_cli_credentials(
+        self, profile_id: str, *, email: str | None = None, timeout: float = 600.0
+    ) -> bytes:
+        """Run `claude auth login`, approve it in the profile's browser, archive it.
 
-        The CLI runs with HOME pointed at the profile's claude_home and its proxy
-        pointed at the profile's sing-box port, so the OAuth exchange happens from
-        the same IP/fingerprint as everything else.
+        `auth login` (not the `login` TUI step) prints the authorization URL and
+        then waits for a pasted code, so its output has to be read while it is
+        still running -- awaiting `communicate()` first would find nothing but the
+        final exit. The CLI runs with HOME pointed at the profile's claude_home
+        and its proxy pointed at the profile's sing-box port, so the whole OAuth
+        exchange leaves from the same IP and fingerprint as everything else.
         """
         profile = await self._db.get_profile(profile_id)
         if profile is None:
@@ -172,9 +177,11 @@ class BrowserPool:
         async with self.acquire_context(profile_id, headless=self._headless, start_url=None) as context:
             proc = await asyncio.create_subprocess_exec(
                 "claude",
+                "auth",
                 "login",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.PIPE,
                 env={
                     "HOME": str(home),
                     "PATH": _shell_path(),
@@ -182,16 +189,27 @@ class BrowserPool:
                     "HTTP_PROXY": proxy_url,
                 },
             )
-            output = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            log = output[0].decode("utf-8", "replace") if output[0] else ""
-            if proc.returncode != 0:
-                raise BrowserPoolError(f"claude login failed ({proc.returncode}): {log[-800:]}")
-
-            url = _extract_url(log)
-            if url:
-                page = await context.new_page()
-                await page.goto(url, wait_until="domcontentloaded")
+            try:
+                url = await asyncio.wait_for(_read_authorize_url(proc, home), timeout=timeout)
+                if url:
+                    page = await context.new_page()
+                    code = await _drive_consent(page, url, email=email, timeout=timeout)
+                    if code:
+                        # The CLI is blocked on its prompt; without this write
+                        # the browser would have authenticated nothing.
+                        assert proc.stdin is not None
+                        proc.stdin.write(code.encode() + b"\n")
+                        await proc.stdin.drain()
                 await _wait_for_credentials(home, timeout=timeout)
+            finally:
+                # The token is already on disk; a still-waiting prompt must not
+                # outlive the call.
+                if proc.returncode is None:
+                    proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    proc.kill()
 
         blob = _archive_and_encrypt(self._profiles.claude_home_dir(profile_id), associated=profile_id)
         await self._db.save_credentials(profile_id, blob)
@@ -287,11 +305,91 @@ def _shell_path() -> str:
     return os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
 
 
+async def _drive_consent(page: Any, url: str, *, email: str | None, timeout: float) -> str | None:
+    """Walk the sign-in page until it hands back the authorization code.
+
+    Returns None when the browser ends somewhere the caller can finish by hand
+    (a password / SSO prompt, say) instead of pretending success. A brand-new
+    account is the fully automatic path: the email is already known, Cloudflare
+    is passed by the real kernel, and the consent button is the only click.
+    """
+    from core.login import (
+        auto_consent,
+        captcha_token,
+        click_email_login,
+        extract_code,
+        fill_email,
+        needs_human,
+        solve_captcha,
+    )
+
+    await page.goto(url, wait_until="commit", timeout=timeout * 1000)
+    deadline = asyncio.get_running_loop().time() + timeout
+    submitted_email = False
+    captcha_tries = 0
+    while asyncio.get_running_loop().time() < deadline:
+        current = page.url or ""
+        code = extract_code(current)
+        if code:
+            return code
+        if needs_human(current):
+            return None
+        try:
+            if email and not submitted_email and await fill_email(page, email):
+                submitted_email = True
+                await auto_consent(page)
+                # The form only posts once a token exists; the widget mounts a
+                # moment after the email step, so give it one pass first.
+                await asyncio.sleep(1.0)
+                if await captcha_token(page) <= 0 and captcha_tries < 3:
+                    captcha_tries += 1
+                    if await solve_captcha(page):
+                        continue
+            elif not await auto_consent(page) and not submitted_email:
+                await click_email_login(page)
+        except Exception:  # noqa: BLE001 - a page mid-render is not a failure
+            pass
+        await asyncio.sleep(1.0)
+    return None
+
+
 def _extract_url(text: str) -> str | None:
     for token in text.replace("\n", " ").split():
         if token.startswith("https://") and ("anthropic" in token or "claude" in token):
             return token.strip(".,)")
     return None
+
+
+async def _read_authorize_url(
+    proc: asyncio.subprocess.Process, home: Path, *, idle: float = 2.0
+) -> str | None:
+    """Watch the login output until it prints the authorization URL.
+
+    Also stops early when the credential file appears first, and returns the
+    tail of the output on an early exit so the caller can report why. The wait
+    between lines is short because a cached identity writes the file without
+    printing anything, so the poll is what ends the loop.
+    """
+    assert proc.stdout is not None
+    seen: list[str] = []
+    credentials = home / ".claude" / ".credentials.json"
+    while True:
+        if credentials.exists():
+            return _extract_url(" ".join(seen))
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=idle)
+        except asyncio.TimeoutError:
+            continue
+        if not raw:
+            if proc.returncode not in (None, 0):
+                tail = " ".join(seen)[-500:]
+                raise BrowserPoolError(f"claude auth login exited {proc.returncode}: {tail}")
+            return None
+        line = raw.decode("utf-8", "replace")
+        seen.append(line.strip())
+        url = _extract_url(line)
+        if url:
+            return url
 
 
 async def _wait_for_credentials(home: Path, timeout: float, interval: float = 1.0) -> None:
