@@ -211,6 +211,17 @@ def create_app() -> FastAPI:
 
     # -- health ------------------------------------------------------------
 
+    @app.get("/")
+    async def index() -> dict[str, Any]:
+        """Liveness index. Deployed under a path prefix it is the landing page."""
+        return {
+            "service": "claude-cluster-engine",
+            "version": app.version,
+            "docs": "/docs",
+            "health": "/healthz",
+            "ready": "/readyz",
+        }
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         return {"ok": True, "time": _now_iso()}
