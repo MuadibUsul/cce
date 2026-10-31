@@ -18,8 +18,9 @@ def test_register_and_render_one_route() -> None:
     assert config["inbounds"][0]["listen_port"] == 10001
     assert config["outbounds"][0]["server"] == "1.2.3.4"
     assert config["outbounds"][0]["username"] == "user"
-    assert config["route"]["rules"][0]["inbound"] == config["inbounds"][0]["tag"]
-    assert config["route"]["rules"][0]["outbound"] == config["outbounds"][0]["tag"]
+    routes = [rule for rule in config["route"]["rules"] if rule.get("type") == "default"]
+    assert routes[0]["inbound"] == config["inbounds"][0]["tag"]
+    assert routes[0]["outbound"] == config["outbounds"][0]["tag"]
 
 
 def test_routes_are_isolated_per_port() -> None:
@@ -29,10 +30,19 @@ def test_routes_are_isolated_per_port() -> None:
 
     config = manager.render()
     assert len(config["inbounds"]) == 2
-    for rule in config["route"]["rules"]:
+    for rule in (rule for rule in config["route"]["rules"] if rule.get("type") == "default"):
         inbound = next(i for i in config["inbounds"] if i["tag"] == rule["inbound"])
         outbound = next(o for o in config["outbounds"] if o["tag"] == rule["outbound"])
         assert inbound["listen_port"] == 10001 if outbound["server"] == "1.1.1.1" else 10002
+
+
+def test_sniff_precedes_routing() -> None:
+    """sing-box 1.11 moved sniffing to a route action; it must run first."""
+    manager = SingBoxManager()
+    manager.register("acct-1", 10001, "socks5://1.1.1.1:1080")
+    rules = manager.render()["route"]["rules"]
+    assert rules[0] == {"action": "sniff"}
+    assert all(rule.get("type") == "default" for rule in rules[1:])
 
 
 def test_unregister_removes_route() -> None:

@@ -181,6 +181,24 @@ async def test_launcher_session_issues_the_secret_and_others_require_it(client: 
 
 
 @pytest.mark.asyncio
+async def test_issued_secret_is_exported_for_the_gateway(client: httpx.AsyncClient) -> None:
+    """The gateway authorises per key, so issue/revoke has to reach its file."""
+    from api import app as app_module
+
+    await _create_profile(client)
+    key = (
+        await client.post(
+            "/admin/keys", headers=admin(), json={"profile_id": "acct-api", "plan_tier": "pro"}
+        )
+    ).json()
+    path = app_module.Path(app_module.DB_PATH).with_suffix(".secrets")
+    body = path.read_text()
+    assert f"{key['card_key']} {key['tunnel_secret']}" in body
+
+    await client.delete(f"/admin/keys/{key['card_key']}", headers=admin())
+    assert key["tunnel_secret"] not in path.read_text()
+
+
 async def test_revoked_key_rejected(client: httpx.AsyncClient) -> None:
     await _create_profile(client)
     key = (

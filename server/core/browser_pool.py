@@ -193,7 +193,20 @@ class BrowserPool:
                 await page.goto(url, wait_until="domcontentloaded")
                 await _wait_for_credentials(home, timeout=timeout)
 
-        blob = _archive_and_encrypt(self._profiles.claude_home_dir(profile_id).parent / "claude_home")
+        blob = _archive_and_encrypt(self._profiles.claude_home_dir(profile_id), associated=profile_id)
+        await self._db.save_credentials(profile_id, blob)
+        return blob
+
+    async def import_claude_credentials(self, profile_id: str, dot_claude: Path) -> bytes:
+        """Seal an already-authenticated `.claude` dir without a browser.
+
+        Ops escape hatch for a host where the interactive OAuth flow cannot run:
+        the directory is treated exactly like one produced by the flow, so the
+        delivery path downstream is identical.
+        """
+        if not dot_claude.is_dir():
+            raise BrowserPoolError(f"not a directory: {dot_claude}")
+        blob = _archive_and_encrypt(dot_claude.parent, associated=profile_id)
         await self._db.save_credentials(profile_id, blob)
         return blob
 
@@ -292,8 +305,12 @@ async def _wait_for_credentials(home: Path, timeout: float, interval: float = 1.
     raise BrowserPoolError("timed out waiting for claude credentials after login")
 
 
-def _archive_and_encrypt(claude_home: Path) -> bytes:
-    """tar.gz the `.claude` dir, then hand the bytes to the crypto layer."""
+def _archive_and_encrypt(claude_home: Path, *, associated: str | None = None) -> bytes:
+    """tar.gz the `.claude` dir, then hand the bytes to the crypto layer.
+
+    The associated data binds the blob to its profile, so a swapped ciphertext
+    cannot be replayed against another account.
+    """
     from core.crypto import encrypt_blob
 
     dot_claude = claude_home / ".claude"
@@ -302,4 +319,4 @@ def _archive_and_encrypt(claude_home: Path) -> bytes:
         with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
             archive.add(target, arcname=".claude")
         buffer.seek(0)
-        return encrypt_blob(buffer.read())
+        return encrypt_blob(buffer.read(), associated=associated.encode() if associated else None)

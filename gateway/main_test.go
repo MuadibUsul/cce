@@ -14,6 +14,8 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -139,7 +141,7 @@ func TestPeekClientHelloRejectsPlaintext(t *testing.T) {
 // checked instead.
 func TestGatewayTerminatesWhenClientDialsTheGateway(t *testing.T) {
 	certificate := testCertificate(t)
-	g := &gateway{domains: newWhitelist([]string{"*.anthropic.com", "127.0.0.1"}), certificate: &certificate}
+	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com", "127.0.0.1"}), certificate: &certificate}
 
 	origin, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -271,7 +273,7 @@ func TestConnectTunnelEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer front.Close()
-	g := &gateway{domains: newWhitelist([]string{"127.0.0.1"})}
+	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"127.0.0.1"})}
 	go func() {
 		for {
 			conn, err := front.Accept()
@@ -317,6 +319,53 @@ func TestConnectTunnelEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSecretsAuthorisesExportedKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets")
+	write := func(body string) {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set := newSecrets("", path)
+
+	write("# card_key secret expires_at\ncce-a aaa 2099-01-01T00:00:00Z\n")
+	if !set.has("aaa") {
+		t.Fatal("exported secret should authorise")
+	}
+	if set.has("bbb") || set.has("") {
+		t.Fatal("unknown or empty secret should not authorise")
+	}
+
+	// A revocation rewrites the file; the change has to land without a restart.
+	write("cce-b bbb 2099-01-01T00:00:00Z\n")
+	if set.has("aaa") {
+		t.Error("removed secret still authorises")
+	}
+	if !set.has("bbb") {
+		t.Error("freshly exported secret rejected")
+	}
+
+	write("cce-old ccc 2000-01-01T00:00:00Z\n")
+	if set.has("ccc") {
+		t.Error("expired secret should not authorise")
+	}
+}
+
+func TestStaticSecretAlsoWorks(t *testing.T) {
+	set := newSecrets("s3cret", "")
+	if !set.has("s3cret") || set.has("other") {
+		t.Fatal("static comparison is wrong")
+	}
+	if set.enabled() != true {
+		t.Fatal("configured gateway must demand a secret")
+	}
+	// No secret configured at all means an open tunnel, which local dev needs.
+	if newSecrets("", "").enabled() {
+		t.Fatal("empty gateway should not demand a secret")
+	}
+}
+
 func itoa(n int) string {
 	var buf [8]byte
 	pos := len(buf)
@@ -338,7 +387,7 @@ func TestBlockedDomainClosesConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer front.Close()
-	g := &gateway{domains: newWhitelist([]string{"*.anthropic.com"})}
+	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com"})}
 	go func() {
 		for {
 			conn, err := front.Accept()
@@ -418,7 +467,7 @@ func TestDialOriginGoesThroughRelay(t *testing.T) {
 		io.WriteString(conn, "relayed")
 	}()
 
-	g := &gateway{domains: newWhitelist([]string{"*.anthropic.com"}), minPort: 1, maxPort: 65535}
+	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com"}), minPort: 1, maxPort: 65535}
 
 	conn, err := g.dialOrigin(requestHead{host: "api.anthropic.com", port: "443", profile: relayPort})
 	if err != nil {
@@ -459,7 +508,7 @@ func TestDialOriginFallsBackWithoutProfilePort(t *testing.T) {
 		conn.Close()
 	}()
 
-	g := &gateway{domains: newWhitelist([]string{"*.anthropic.com"})}
+	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com"})}
 	conn, err := g.dialOrigin(requestHead{host: host, port: port})
 	if err != nil {
 		t.Fatalf("dialOrigin: %v", err)
@@ -468,11 +517,38 @@ func TestDialOriginFallsBackWithoutProfilePort(t *testing.T) {
 }
 
 func TestDialOriginRejectsOutOfRangePort(t *testing.T) {
-	g := &gateway{domains: newWhitelist([]string{"*.anthropic.com"})}
+	g := &gateway{secrets: newSecrets("", ""), domains: newWhitelist([]string{"*.anthropic.com"})}
 	for _, port := range []string{"80", "12000", "not-a-port"} {
 		if _, err := g.dialOrigin(requestHead{host: "127.0.0.1", port: "1", profile: port}); err == nil {
 			t.Errorf("profile port %q should be refused", port)
 		}
+	}
+}
+
+func TestGeneratedCertificateIsUsableForTheDialledName(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CCE_TUNNEL_SAN", "gw.example.com")
+	certificate, err := loadCertificate(filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key"))
+	if err != nil {
+		t.Fatalf("loadCertificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err := leaf.VerifyHostname("gw.example.com"); err != nil {
+		t.Errorf("generated certificate does not cover the configured name: %v", err)
+	}
+	if err := leaf.VerifyHostname("127.0.0.1"); err != nil {
+		t.Errorf("loopback should always be covered: %v", err)
+	}
+	// A generated keypair has to survive a restart, otherwise the pin breaks.
+	again, err := loadCertificate(filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key"))
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !bytes.Equal(again.Certificate[0], certificate.Certificate[0]) {
+		t.Error("certificate was regenerated instead of reused")
 	}
 }
 

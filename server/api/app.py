@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import os
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
@@ -32,6 +33,8 @@ DB_PATH = os.environ.get("CCE_DB_PATH", "data/cce.sqlite3")
 ADMIN_TOKEN_ENV = "CCE_ADMIN_TOKEN"
 TUNNEL_HOST = os.environ.get("CCE_TUNNEL_HOST", "")
 TUNNEL_PORT = int(os.environ.get("CCE_TUNNEL_PORT", "8443"))
+# Where issued tunnel secrets are mirrored for the gateway (CCE_TUNNEL_SECRETS).
+SECRETS_PATH = os.environ.get("CCE_TUNNEL_SECRETS", "")
 
 
 class ProfileCreate(BaseModel):
@@ -48,6 +51,10 @@ class BatchCreate(BaseModel):
     bin_prefix: str = Field(min_length=4, max_length=10)
     billing_country: str = Field(min_length=2, max_length=2)
     max_accounts: int = Field(default=10, ge=1, le=100)
+
+
+class ImportCredentials(BaseModel):
+    path: str
 
 
 class KeyIssue(BaseModel):
@@ -209,6 +216,14 @@ def create_app() -> FastAPI:
         blob = await state.pool.sync_claude_cli_credentials(profile_id)
         return {"profile_id": profile_id, "bytes": len(blob)}
 
+    @app.post("/admin/profiles/{profile_id}/import-credentials", dependencies=[admin])
+    async def import_credentials(profile_id: str, body: ImportCredentials) -> dict[str, Any]:
+        """Seal an existing `.claude` dir (ops path when OAuth cannot be driven)."""
+        if await state.db.get_profile(profile_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "profile not found")
+        blob = await state.pool.import_claude_credentials(profile_id, Path(body.path))
+        return {"profile_id": profile_id, "bytes": len(blob)}
+
     @app.get("/admin/singbox", dependencies=[admin])
     async def singbox_state() -> dict[str, Any]:
         return {"available": state.singbox.available, "running": state.singbox.running, "config": state.singbox.render()}
@@ -234,6 +249,7 @@ def create_app() -> FastAPI:
             "expires_at": (_now() + timedelta(days=body.valid_days)).isoformat(),
         }
         await state.db.insert_delivery_key(record)
+        await _export_secrets()
         return {"card_key": card_key, "tunnel_secret": tunnel_secret, "expires_at": record["expires_at"]}
 
     @app.get("/admin/keys/{profile_id}", dependencies=[admin])
@@ -243,7 +259,13 @@ def create_app() -> FastAPI:
     @app.delete("/admin/keys/{card_key}", dependencies=[admin])
     async def revoke_key(card_key: str) -> dict[str, Any]:
         await state.db.revoke_delivery_key(card_key)
+        await _export_secrets()
         return {"revoked": card_key}
+
+    @app.post("/admin/tunnel-secrets", dependencies=[admin])
+    async def export_secrets() -> dict[str, Any]:
+        """Rewrite the gateway's secret file; called after issue/revoke."""
+        return await _export_secrets(force=True)
 
     # -- launcher ----------------------------------------------------------
 
@@ -272,7 +294,7 @@ def create_app() -> FastAPI:
         blob = stored.get("claude_credentials_enc") if stored else None
         if not blob:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no credentials synced for this profile")
-        tar_gz = decrypt_blob(bytes(blob))
+        tar_gz = decrypt_blob(bytes(blob), associated=row["profile_id"].encode())
         return Response(
             content=tar_gz,
             media_type="application/gzip",
@@ -300,9 +322,32 @@ def create_app() -> FastAPI:
         blob = stored.get("claude_credentials_enc") if stored else None
         if not blob:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no credentials synced")
-        return {"profile_id": row["profile_id"], "tar_gz_b64": base64.b64encode(decrypt_blob(bytes(blob))).decode()}
+        return {"profile_id": row["profile_id"], "tar_gz_b64": base64.b64encode(decrypt_blob(bytes(blob), associated=row["profile_id"].encode())).decode()}
 
     return app
+
+
+async def _export_secrets(*, force: bool = False) -> dict[str, Any]:
+    """Mirror active, unexpired tunnel secrets where the gateway can read them.
+
+    The gateway holds one secret per card key, not a single shared value, so it
+    needs the set shipped to it. Writing is idempotent and skipped when nothing
+    changed, which keeps a fleet-sized file from being rewritten per request.
+    """
+    path = Path(SECRETS_PATH) if SECRETS_PATH else Path(DB_PATH).with_suffix(".secrets")
+    rows = await state.db.fetch_all(
+        "SELECT card_key, tunnel_secret, expires_at FROM delivery_keys"
+        " WHERE is_active = 1 AND expires_at > ? ORDER BY card_key",
+        (_now_iso(),),
+    )
+    body = "# card_key secret expires_at\n" + "".join(
+        f"{row['card_key']} {row['tunnel_secret']} {row['expires_at']}\n" for row in rows
+    )
+    if force or not path.exists() or path.read_text(encoding="utf-8") != body:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        os.chmod(path, 0o600)
+    return {"path": str(path), "keys": len(rows)}
 
 
 def _public_profile(row: dict[str, Any]) -> dict[str, Any]:

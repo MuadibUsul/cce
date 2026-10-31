@@ -33,7 +33,6 @@ def build_inbound(profile_id: str, local_port: int) -> dict[str, Any]:
         "tag": f"p-{local_port}",
         "listen": "127.0.0.1",
         "listen_port": local_port,
-        "sniff": True,
     }
 
 
@@ -88,7 +87,10 @@ class SingBoxManager:
     def render(self) -> dict[str, Any]:
         inbounds = [route["inbound"] for _, route in sorted(self._route.items())]
         outbounds = [route["outbound"] for _, route in sorted(self._route.items())]
-        rules = [
+        # Sniffing moved off the inbound in sing-box 1.11: it is a route action
+        # that has to run before any routing rule picks an outbound.
+        rules: list[dict[str, Any]] = [{"action": "sniff"}]
+        rules += [
             {"type": "default", "inbound": route["inbound"]["tag"], "outbound": route["outbound"]["tag"]}
             for _, route in sorted(self._route.items())
         ]

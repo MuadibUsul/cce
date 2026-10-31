@@ -8,9 +8,7 @@
       "type": "mixed",
       "tag": "profile-in",
       "listen": "127.0.0.1",
-      "listen_port": 10001,
-      "sniff": true,
-      "sniff_override_destination": false
+      "listen_port": 10001
     }
   ],
   "outbounds": [
@@ -26,6 +24,9 @@
   ],
   "route": {
     "rules": [
+      {
+        "action": "sniff"
+      },
       {
         "type": "default",
         "outbound": "upstream"

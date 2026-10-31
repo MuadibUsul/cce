@@ -100,10 +100,17 @@ kernel: point `--runtime` at an extracted bundle or set `CCE_KERNEL_URL`.
 ## Environment
 
 Server: `CCE_ADMIN_TOKEN`, `CCE_MASTER_KEY`, `CCE_TUNNEL_HOST`, `CCE_TUNNEL_PORT`,
-`CCE_TUNNEL_CERT`, `CCE_TUNNEL_KEY`, `CCE_DB_PATH`.
+`CCE_TUNNEL_CERT`, `CCE_TUNNEL_KEY`, `CCE_TUNNEL_SECRETS`, `CCE_DB_PATH`.
 
 Launcher: `CCE_HOST`, `CCE_GATEWAY`, `CCE_TUNNEL_CA`, `CCE_KERNEL_URL`,
 `CCE_HEADLESS`, `CCE_EXTRA_PREFS`.
+
+Every card key carries its own tunnel secret, so the gateway reads a set: point
+`CCE_TUNNEL_SECRETS` at the file the control plane writes (`/admin/keys`,
+`/admin/keys/{card_key}` and `/admin/tunnel-secrets` keep it current) and mount
+it read-only into the gateway. `CCE_TUNNEL_SECRET` still works as one static
+value for a single-machine run. The file is re-read when it changes, so a
+revocation lands without a restart.
 
 `claude-box` verifies the gateway by name; a private CA goes in `CCE_TUNNEL_CA`,
 and desktop mode additionally needs that CA in the browser's own store because
@@ -121,6 +128,11 @@ E2E_EXPECTED=198.51.100.4 .venv/bin/python tests/e2e/run_cli.py   # IP drift abo
 E2E_DEAD_RELAY=1 .venv/bin/python tests/e2e/run_cli.py      # dead exit aborts
 CCE_RUNTIME=<camoufox bundle> .venv/bin/python tests/e2e/run_desktop.py
 ```
+
+`tests/live.py` goes further and uses the real network: real control plane, real
+sing-box port map, real gateway, real `claude`. It needs an upstream SOCKS proxy
+in `CCE_UPSTREAM` (default `socks5://127.0.0.1:12080`) and checks the exit IP, the
+`api.anthropic.com` status through the tunnel, and the CLI itself.
 
 The desktop harness asserts the browser presents the stored UA, `Accept-Language`
 and timezone offset. It imports a throwaway CA with `certutil` first, because

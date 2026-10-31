@@ -15,6 +15,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -180,9 +181,80 @@ func parseSNI(body []byte) (string, error) {
 	return "", errNoSNI
 }
 
+// secrets authorises tunnel clients.
+//
+// Every card key carries its own random tunnel secret, so a single static value
+// cannot cover a fleet. The gateway keeps a set: `CCE_TUNNEL_SECRET` for
+// single-machine runs, plus an optional file the control plane exports, which is
+// re-read whenever its mtime changes so a revocation lands without a restart.
+type secrets struct {
+	fixed string
+	path  string
+	mu    sync.Mutex
+	seen  time.Time
+	extra map[string]struct{}
+}
+
+func newSecrets(fixed, path string) *secrets {
+	return &secrets{fixed: fixed, path: path}
+}
+
+func (s *secrets) has(secret string) bool {
+	if secret == "" {
+		return false
+	}
+	if s.fixed != "" && subtle.ConstantTimeCompare([]byte(secret), []byte(s.fixed)) == 1 {
+		return true
+	}
+	if s.path == "" {
+		return false
+	}
+	for candidate := range s.load() {
+		if subtle.ConstantTimeCompare([]byte(secret), []byte(candidate)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// load refreshes the exported set, one `card_key secret expires_at` per line.
+func (s *secrets) load() map[string]struct{} {
+	info, err := os.Stat(s.path)
+	if err != nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if info.ModTime().Equal(s.seen) && s.extra != nil {
+		return s.extra
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return s.extra
+	}
+	next := make(map[string]struct{})
+	now := time.Now()
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		if len(fields) > 2 {
+			if expires, err := time.Parse(time.RFC3339, fields[2]); err == nil && expires.Before(now) {
+				continue
+			}
+		}
+		next[fields[1]] = struct{}{}
+	}
+	s.seen, s.extra = info.ModTime(), next
+	return next
+}
+
+func (s *secrets) enabled() bool { return s.fixed != "" || s.path != "" }
+
 type gateway struct {
 	domains *whitelist
-	secret  string
+	secrets *secrets
 	debug   bool
 	// Port span a launcher may name; zero means the sing-box default range.
 	minPort int
@@ -281,7 +353,7 @@ func (g *gateway) handleConnect(conn net.Conn, reader *bufio.Reader) {
 		fmt.Fprint(conn, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
-	if g.secret != "" && request.bearer != g.secret {
+	if g.secrets.enabled() && !g.secrets.has(request.bearer) {
 		fmt.Fprint(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
@@ -478,14 +550,15 @@ func main() {
 	if *domainsFlag != "" {
 		domains = strings.Split(*domainsFlag, ",")
 	}
-	secret := os.Getenv("CCE_TUNNEL_SECRET")
+	tunnelSecrets := newSecrets(os.Getenv("CCE_TUNNEL_SECRET"),
+		envOr("CCE_TUNNEL_SECRETS", ""))
 
 	certificate, err := loadCertificate(*certPath, *keyPath)
 	if err != nil {
 		log.Fatalf("certificate: %v", err)
 	}
 
-	g := &gateway{domains: newWhitelist(domains), secret: secret, debug: *debug, certificate: certificate}
+	g := &gateway{domains: newWhitelist(domains), secrets: tunnelSecrets, debug: *debug, certificate: certificate}
 
 	// Always a plain TCP listener. The gateway is a pass-through, so the bytes it
 	// inspects have to be the original TLS records; termination happens at the
@@ -546,6 +619,7 @@ func loadCertificate(certPath, keyPath string) (*tls.Certificate, error) {
 	// A self-signed certificate is only usable if it can be validated for the
 	// name the launcher dials. CCE_TUNNEL_SAN names that (comma separated
 	// hostnames/IPs); loopback is always included so a local run works.
+	template.DNSNames = certificateNames()
 	for _, name := range []string{"127.0.0.1", "::1"} {
 		template.IPAddresses = append(template.IPAddresses, net.ParseIP(name))
 	}
