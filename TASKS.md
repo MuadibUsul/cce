@@ -36,10 +36,16 @@ Legend: `[ ]` todo · `[>]` in progress · `[x]` done · `[!]` blocked
 - [x] go build green, go vet/gofmt clean, go test green in both modules
 - [x] end-to-end CLI harness (happy path / IP drift / dead relay)
 - [x] end-to-end desktop harness with the real kernel: identity + whitelist proven
-- [ ] end-to-end run against a real static residential IP (`claude-box cli --key test_001`)
+- [x] end-to-end run against a real static residential IP (`claude-box cli --key test_001`)
 - [x] README + run instructions
 
 ## Findings worth keeping
+- Per-key tunnel secrets needed a gateway-side set, not one static value
+  (`CCE_TUNNEL_SECRETS`, hot-reloaded).
+- sing-box 1.11 moved inbound sniffing to a route action; 1.14 rejects the old
+  field outright.
+- Credential blobs must be sealed *and* opened with the profile as associated
+  data, or the swap guard is worthless.
 - Camoufox needs `<bundle>/../.0.5_FLAG`; without it the kernel refuses to start.
 - The bare kernel has no `--fingerprint/--timezone/--lang/--proxy-server` flags —
   identity ships through `CAMOU_CONFIG_n`/`CAMOU_PREFS_n` and `-profile <dir> -no-remote`.
