@@ -170,3 +170,29 @@ def test_extract_url_prefers_an_oauth_url() -> None:
 
 def test_module_imports_are_stable() -> None:
     assert sys.version_info >= (3, 11)
+
+
+# -- import-credentials -----------------------------------------------------
+
+
+async def test_import_seals_only_dot_claude_not_the_whole_directory(
+    db: Database, profiles: object, pool: FakePool, tmp_path: Path
+) -> None:
+    """Pointing at the profile dir used to seal its parent as well.
+
+    A `~/.claude` store is a few KB; sealing the containing directory instead
+    drags in whatever else lives there. On a real host that turned a 16-byte
+    credential into a 440 MB blob, which OOM-killed the control plane on the
+    next boot.
+    """
+    home = tmp_path / "host"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / ".credentials.json").write_text('{"token":"t"}')
+    # A big sibling that must NOT end up in the archive.
+    (home / "database.sqlite3").write_bytes(b"x" * 200_000)
+
+    for target in (home, home / ".claude"):
+        blob = await pool.import_claude_credentials("acct-imp", target)
+        names = archive_names(decrypt_blob(blob, associated=b"acct-imp"))
+        assert names == [".claude", ".claude/.credentials.json"], (target, names)
+    assert len(blob) < 10_000

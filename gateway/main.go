@@ -623,10 +623,15 @@ func loadCertificate(certPath, keyPath string) (*tls.Certificate, error) {
 	}
 	// A self-signed certificate is only usable if it can be validated for the
 	// name the launcher dials. CCE_TUNNEL_SAN names that (comma separated
-	// hostnames/IPs); loopback is always included so a local run works.
-	template.DNSNames = certificateNames()
-	for _, name := range []string{"127.0.0.1", "::1"} {
-		template.IPAddresses = append(template.IPAddresses, net.ParseIP(name))
+	// hostnames/IPs); loopback is always included so a local run works. An IP
+	// has to land in IPAddresses, not DNSNames, or a client dialling the bare
+	// address fails verification with "not valid for <ip>".
+	dnsNames, extraIPs := certificateNames()
+	template.DNSNames = dnsNames
+	for _, name := range append([]string{"127.0.0.1", "::1"}, extraIPs...) {
+		if ip := net.ParseIP(name); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
@@ -659,18 +664,28 @@ func loadCertificate(certPath, keyPath string) (*tls.Certificate, error) {
 	return &loaded, nil
 }
 
-// certificateNames is the DNS name list baked into a generated certificate.
-func certificateNames() []string {
-	names := []string{"localhost"}
+// certificateNames splits the generated certificate's subject names into DNS
+// names and IP addresses. An IP literal must not be written as a DNS name: the
+// TLS client matches it against IPAddresses only.
+func certificateNames() (dnsNames, ips []string) {
+	for _, name := range []string{"localhost"} {
+		dnsNames = append(dnsNames, name)
+	}
 	if host, err := os.Hostname(); err == nil && host != "" {
-		names = append(names, host)
+		dnsNames = append(dnsNames, host)
 	}
 	for _, extra := range strings.Split(os.Getenv("CCE_TUNNEL_SAN"), ",") {
-		if extra = strings.TrimSpace(extra); extra != "" {
-			names = append(names, extra)
+		extra = strings.TrimSpace(extra)
+		if extra == "" {
+			continue
 		}
+		if net.ParseIP(extra) != nil {
+			ips = append(ips, extra)
+			continue
+		}
+		dnsNames = append(dnsNames, extra)
 	}
-	return names
+	return dnsNames, ips
 }
 
 func envOr(name, fallback string) string {

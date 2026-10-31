@@ -571,7 +571,7 @@ func TestDialOriginRejectsOutOfRangePort(t *testing.T) {
 
 func TestGeneratedCertificateIsUsableForTheDialledName(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("CCE_TUNNEL_SAN", "gw.example.com")
+	t.Setenv("CCE_TUNNEL_SAN", "gw.example.com,203.0.113.55")
 	certificate, err := loadCertificate(filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key"))
 	if err != nil {
 		t.Fatalf("loadCertificate: %v", err)
@@ -579,6 +579,16 @@ func TestGeneratedCertificateIsUsableForTheDialledName(t *testing.T) {
 	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
 	if err != nil {
 		t.Fatalf("parse: %v", err)
+	}
+	// An IP in CCE_TUNNEL_SAN has to land in IPAddresses; writing it as a DNS
+	// name makes every client that dials the bare address fail verification.
+	if err := leaf.VerifyHostname("203.0.113.55"); err != nil {
+		t.Errorf("IP SAN is not usable: %v", err)
+	}
+	for _, dns := range leaf.DNSNames {
+		if net.ParseIP(dns) != nil {
+			t.Errorf("%q was written as a DNS name", dns)
+		}
 	}
 	if err := leaf.VerifyHostname("gw.example.com"); err != nil {
 		t.Errorf("generated certificate does not cover the configured name: %v", err)

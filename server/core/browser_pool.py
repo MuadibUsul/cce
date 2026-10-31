@@ -224,10 +224,19 @@ class BrowserPool:
         Ops escape hatch for a host where the interactive OAuth flow cannot run:
         the directory is treated exactly like one produced by the flow, so the
         delivery path downstream is identical.
+
+        `dot_claude` is the `.claude` directory itself. `_archive_and_encrypt`
+        wants its *parent* (it appends `.claude`), and taking `.parent` here a
+        second time would seal the whole containing directory -- which is how a
+        16-byte store once became a 440 MB blob that OOM-killed the control
+        plane on the next boot.
         """
         if not dot_claude.is_dir():
             raise BrowserPoolError(f"not a directory: {dot_claude}")
-        blob = _archive_and_encrypt(dot_claude.parent, associated=profile_id)
+        # Accept either the `.claude` directory or the profile dir that holds
+        # it; _archive_and_encrypt appends `.claude` itself.
+        home = dot_claude.parent if dot_claude.name == ".claude" else dot_claude
+        blob = _archive_and_encrypt(home, associated=profile_id)
         await self._db.save_credentials(profile_id, blob)
         return blob
 

@@ -71,6 +71,15 @@ class SingBoxManager:
         return shutil.which(self._binary) is not None
 
     @property
+    def resolved(self) -> str | None:
+        """Absolute path to the binary.
+
+        `create_subprocess_exec` does not apply PATHEXT on Windows, so a bare
+        "sing-box" fails with WinError 2 even though `shutil.which` found it.
+        """
+        return shutil.which(self._binary)
+
+    @property
     def running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
@@ -111,17 +120,23 @@ class SingBoxManager:
         if not self._route:
             raise SingBoxError("no routes registered")
         path = self.write_config()
-        if not self.available:
+        binary = self.resolved
+        if binary is None:
             return {"applied": False, "reason": "sing-box binary not found", "config": str(path)}
         await self.stop()
         self._proc = await asyncio.create_subprocess_exec(
-            self._binary, "run", "-c", str(path), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            binary, "run", "-c", str(path), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
         await asyncio.sleep(0.4)
         if self._proc.returncode not in (None, 0):
+            # `read()` would block forever on a child the OS has not reaped yet,
+            # and an unread pipe is how an empty "exited immediately:" happens.
             err = b""
             if self._proc.stderr:
-                err = await self._proc.stderr.read()
+                try:
+                    err = await asyncio.wait_for(self._proc.stderr.read(), timeout=2)
+                except (asyncio.TimeoutError, OSError):
+                    err = b""
             raise SingBoxError(f"sing-box exited immediately: {err.decode('utf-8', 'replace')[-500:]}")
         return {"applied": True, "config": str(path), "inbounds": len(self._route)}
 
