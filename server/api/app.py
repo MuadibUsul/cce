@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from core.browser_pool import BrowserPool
@@ -34,6 +34,9 @@ from db.database import PLAN_TIERS, Database
 from util.ids import new_card_key, new_token
 
 DB_PATH = os.environ.get("CCE_DB_PATH", "data/cce.sqlite3")
+CONSOLE_PATH = Path(__file__).with_name("console.html")
+# Where the operator drops launcher binaries for customers to download.
+CLIENT_DIR = Path(os.environ.get("CCE_CLIENT_DIR", "data/clients"))
 ADMIN_TOKEN_ENV = "CCE_ADMIN_TOKEN"
 TUNNEL_HOST = os.environ.get("CCE_TUNNEL_HOST", "")
 TUNNEL_PORT = int(os.environ.get("CCE_TUNNEL_PORT", "8443"))
@@ -146,7 +149,7 @@ async def _reaper_loop(interval: float) -> None:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Claude Cluster Engine", version="0.1.0", docs_url="/docs")
+    app = FastAPI(title="Claude Cluster Engine", version="0.1.0", docs_url="/cce-docs", openapi_url="/openapi.json")
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -209,18 +212,30 @@ def create_app() -> FastAPI:
     async def _singbox_error(_request: Any, exc: SingBoxError) -> JSONResponse:
         return JSONResponse({"error": "singbox", "detail": str(exc)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    # -- console -----------------------------------------------------------
+
+    @app.get("/ui", response_class=HTMLResponse)
+    async def console() -> HTMLResponse:
+        """The operator console. Data calls still need the admin token."""
+        return HTMLResponse(CONSOLE_PATH.read_text(encoding="utf-8"))
+
     # -- health ------------------------------------------------------------
 
     @app.get("/")
-    async def index() -> dict[str, Any]:
-        """Liveness index. Deployed under a path prefix it is the landing page."""
-        return {
-            "service": "claude-cluster-engine",
-            "version": app.version,
-            "docs": "/docs",
-            "health": "/healthz",
-            "ready": "/readyz",
-        }
+    async def index(request: Request) -> Response:
+        """Landing page: the console for a browser, a small index for tooling."""
+        if "text/html" in request.headers.get("accept", ""):
+            return HTMLResponse(CONSOLE_PATH.read_text(encoding="utf-8"))
+        return JSONResponse(
+            {
+                "service": "claude-cluster-engine",
+                "version": app.version,
+                "console": "/ui",
+                "docs": "/cce-docs",
+                "health": "/healthz",
+                "ready": "/readyz",
+            }
+        )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -246,6 +261,18 @@ def create_app() -> FastAPI:
     # -- admin -------------------------------------------------------------
 
     admin = Depends(require_admin)
+
+    @app.get("/admin/client", dependencies=[admin])
+    async def list_clients() -> dict[str, Any]:
+        return {"files": list(_client_files())}
+
+    @app.get("/admin/client/{name}", dependencies=[admin])
+    async def download_client(name: str) -> FileResponse:
+        """Serve a launcher binary and the gateway CA from the state directory."""
+        safe = Path(name).name
+        if safe not in _client_files():
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no such file: {safe}")
+        return FileResponse(_client_files()[safe], filename=safe)
 
     @app.post("/admin/batches", dependencies=[admin], status_code=201)
     async def create_batch(body: BatchCreate) -> dict[str, Any]:
@@ -460,6 +487,13 @@ def create_app() -> FastAPI:
 
 async def _export_secrets(*, force: bool = False) -> dict[str, Any]:
     return await export_secrets(state.db, force=force)
+
+
+def _client_files() -> dict[str, Path]:
+    """Files an operator published for customers, keyed by name."""
+    if not CLIENT_DIR.is_dir():
+        return {}
+    return {p.name: p for p in sorted(CLIENT_DIR.iterdir()) if p.is_file()}
 
 
 def _public_profile(row: dict[str, Any]) -> dict[str, Any]:

@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude 账号管理台</title>
+<style>
+  :root {
+    --bg: #0e0e10;
+    --panel: #17171a;
+    --panel-2: #1e1e22;
+    --line: #2a2a30;
+    --text: #ededf0;
+    --muted: #8b8b96;
+    --accent: #4f8dfd;
+    --accent-dim: #2b4f8f;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 80px; }
+
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 26px; flex-wrap: wrap; }
+  h1 { font-size: 19px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .spacer { flex: 1; }
+
+  .btn {
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+    padding: 8px 14px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+    transition: background .13s, border-color .13s, opacity .13s;
+  }
+  .btn:hover:not(:disabled) { background: #26262c; border-color: #3a3a42; }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 560; }
+  .btn-primary:hover:not(:disabled) { background: #3f7ce8; border-color: #3f7ce8; }
+  .btn-sm { padding: 6px 11px; font-size: 13px; }
+  .btn-danger { color: var(--bad); }
+  .btn-danger:hover:not(:disabled) { background: #f8514915; border-color: #f8514955; }
+
+  .gate { max-width: 420px; margin: 12vh auto; text-align: center; }
+  .gate h1 { font-size: 22px; margin-bottom: 8px; }
+  .gate p { color: var(--muted); margin: 0 0 22px; }
+  .gate input { width: 100%; text-align: center; font-family: ui-monospace, Consolas, monospace; }
+
+  input, textarea {
+    width: 100%; background: #101013; border: 1px solid var(--line);
+    padding: 9px 11px; border-radius: 8px; outline: none;
+  }
+  input:focus, textarea:focus { border-color: var(--accent-dim); }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
+  .field { margin-bottom: 14px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .grid { display: grid; gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px 17px;
+  }
+  .card-top { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
+  .name { font-weight: 620; font-size: 15px; word-break: break-all; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 3px; font-family: ui-monospace, Consolas, monospace; }
+
+  .pill {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid transparent; white-space: nowrap; font-weight: 550;
+  }
+  .p-idle { color: var(--ok); background: #3fb9501a; border-color: #3fb95038; }
+  .p-busy { color: var(--accent); background: #4f8dfd1a; border-color: #4f8dfd38; }
+  .p-cooldown { color: var(--warn); background: #d299221a; border-color: #d2992238; }
+  .p-bad { color: var(--bad); background: #f851491a; border-color: #f8514938; }
+  .p-dead { color: var(--muted); background: #8b8b961a; border-color: #8b8b9638; }
+
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .note { font-size: 12.5px; color: var(--muted); margin-top: 9px; }
+  .note b { color: var(--text); font-weight: 550; }
+
+  .empty { text-align: center; padding: 56px 20px; color: var(--muted); border: 1px dashed var(--line); border-radius: var(--radius); }
+
+  .modal-bg {
+    position: fixed; inset: 0; background: #000000b8; display: none;
+    align-items: center; justify-content: center; padding: 20px; z-index: 50;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 22px; width: 100%; max-width: 620px; max-height: 88vh; overflow: auto;
+  }
+  .modal h2 { font-size: 16px; margin: 0 0 4px; }
+  .modal .sub { margin-bottom: 18px; }
+  .modal-foot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+  pre {
+    background: #0a0a0c; border: 1px solid var(--line); border-radius: 8px;
+    padding: 13px; overflow: auto; font: 12.5px/1.6 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all; margin: 0;
+  }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(16px);
+    background: #22222a; border: 1px solid var(--line); padding: 11px 18px;
+    border-radius: 9px; opacity: 0; transition: opacity .18s, transform .18s;
+    pointer-events: none; z-index: 100; max-width: 90vw;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.err { border-color: #f8514955; color: #ffb4b0; }
+
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+  .tab {
+    background: none; border: none; border-bottom: 2px solid transparent;
+    padding: 9px 13px; cursor: pointer; color: var(--muted); margin-bottom: -1px;
+  }
+  .tab.on { color: var(--text); border-bottom-color: var(--accent); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <div>
+      <h1>Claude 账号管理台</h1>
+      <div class="sub" id="fleet-line">—</div>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn" id="btn-refresh">刷新</button>
+    <button class="btn btn-primary" id="btn-add">＋ 添加账号</button>
+    <button class="btn" id="btn-logout">退出</button>
+  </header>
+
+  <div class="tabs">
+    <button class="tab on" data-tab="fleet">账号</button>
+    <button class="tab" data-tab="client">客户端下载</button>
+  </div>
+
+  <section id="tab-fleet">
+    <div class="grid" id="fleet"></div>
+    <div class="empty" id="fleet-empty" hidden>还没有账号，点右上角「添加账号」开始。</div>
+  </section>
+
+  <section id="tab-client" class="hidden">
+    <div class="card">
+      <div class="name">给客户的启动器</div>
+      <div class="note" id="client-note">正在读取…</div>
+      <div class="actions" id="client-links"></div>
+    </div>
+  </section>
+</div>
+
+<div class="gate" id="gate">
+  <h1>Claude 账号管理台</h1>
+  <p>输入管理密码，只需一次</p>
+  <div class="field"><input id="token" type="password" placeholder="管理密码" autocomplete="current-password"></div>
+  <button class="btn btn-primary" id="btn-login" style="width:100%">进入</button>
+</div>
+
+<div class="modal-bg" id="modal-bg"><div class="modal" id="modal"></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const B = location.pathname.replace(/\/ui$/, "").replace(/\/$/, "");
+let TOKEN = localStorage.getItem("cce_token") || "";
+
+const STATUS = {
+  IDLE:       ["可交付", "p-idle"],
+  BUSY:       ["客户使用中", "p-busy"],
+  COOLDOWN:   ["冷却中", "p-cooldown"],
+  AUTH_EXPIRED:["登录已失效", "p-bad"],
+  PROXY_DEAD: ["出口异常", "p-bad"],
+  BANNED:     ["已封禁", "p-dead"],
+};
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function toast(msg, err) {
+  const el = $("#toast");
+  el.textContent = msg;
+  el.className = "toast show" + (err ? " err" : "");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => (el.className = "toast"), 3200);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(B + path, {
+    ...opts,
+    headers: { "x-admin-token": TOKEN, "content-type": "application/json", ...(opts.headers || {}) },
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { detail: text }; }
+  if (res.status === 401) { logout(); throw new Error("密码不对"); }
+  if (!res.ok) throw new Error(data?.detail || data?.error || res.status);
+  return data;
+}
+
+/* -- gate ---------------------------------------------------------------- */
+
+$("#btn-login").onclick = async () => {
+  const value = $("#token").value.trim();
+  if (!value) return toast("请输入管理密码", true);
+  TOKEN = value;
+  try {
+    await api("/admin/profiles");
+    localStorage.setItem("cce_token", value);
+    enter();
+  } catch (e) { toast(e.message, true); }
+};
+$("#token").addEventListener("keydown", (e) => e.key === "Enter" && $("#btn-login").click());
+
+function logout() {
+  localStorage.removeItem("cce_token");
+  $("#app").hidden = true;
+  $("#gate").style.display = "";
+}
+$("#btn-logout").onclick = logout;
+
+function enter() {
+  $("#gate").style.display = "none";
+  $("#app").hidden = false;
+  loadFleet();
+  loadClients();
+}
+
+/* -- fleet --------------------------------------------------------------- */
+
+async function loadFleet() {
+  let data;
+  try { data = await api("/admin/profiles"); } catch (e) { return toast(e.message, true); }
+  const rows = data.profiles || [];
+
+  const counts = {};
+  for (const p of rows) counts[p.status] = (counts[p.status] || 0) + 1;
+  $("#fleet-line").textContent = rows.length
+    ? `${rows.length} 个账号 · ${counts.IDLE || 0} 个可交付 · ${counts.BUSY || 0} 个使用中`
+    : "暂无账号";
+
+  $("#fleet-empty").hidden = rows.length > 0;
+  $("#fleet").innerHTML = rows.map(card).join("");
+  $("#fleet").querySelectorAll("[data-act]").forEach((btn) => {
+    btn.onclick = () => act(btn.dataset.act, btn.dataset.id);
+  });
+}
+
+function card(p) {
+  const [label, cls] = STATUS[p.status] || [p.status, "p-dead"];
+  const trouble = p.status === "PROXY_DEAD" || p.status === "AUTH_EXPIRED";
+
+  return `<div class="card">
+    <div class="card-top">
+      <div style="flex:1">
+        <div class="name">${esc(p.profile_id)}</div>
+        <div class="meta">出口 ${esc(p.expected_ip)} · 端口 ${esc(p.local_proxy_port)}</div>
+      </div>
+      <span class="pill ${cls}">${label}</span>
+    </div>
+    ${p.has_credentials ? "" : `<div class="note">⚠ 还没导入登录凭证，现在交付客户会打不开</div>`}
+    ${trouble ? `<div class="note">出口 IP 变了或登录失效，先改好再< b>释放</b>。</div>` : ""}
+    <div class="actions">
+      <button class="btn btn-primary btn-sm" data-act="deliver" data-id="${esc(p.profile_id)}"
+        ${p.status === "IDLE" && p.has_credentials ? "" : "disabled"}>交付给客户</button>
+      <button class="btn btn-sm" data-act="credential" data-id="${esc(p.profile_id)}">凭证</button>
+      <button class="btn btn-sm" data-act="preflight" data-id="${esc(p.profile_id)}">检测出口</button>
+      <button class="btn btn-sm btn-danger" data-act="release" data-id="${esc(p.profile_id)}">释放</button>
+    </div>
+  </div>`;
+}
+
+/* -- actions ------------------------------------------------------------- */
+
+async function act(kind, id) {
+  if (kind === "release") {
+    if (!confirm(`释放 ${id}？正在跑的客户会被断开。`)) return;
+    try { await api(`/admin/profiles/${id}/release`, { method: "POST" }); toast("已释放"); loadFleet(); }
+    catch (e) { toast(e.message, true); }
+    return;
+  }
+  if (kind === "deliver") return deliver(id);
+  if (kind === "credential") return credential(id);
+  if (kind === "preflight") {
+    toast("正在检测出口…");
+    try { await api(`/admin/profiles/${id}/preflight`, { method: "POST" }); toast("出口正常"); }
+    catch (e) { toast(e.message, true); }
+    loadFleet();
+  }
+}
+
+async function deliver(id) {
+  let key;
+  try {
+    key = await api("/admin/keys", {
+      method: "POST",
+      body: JSON.stringify({ profile_id: id, plan_tier: "pro", valid_days: 30 }),
+    });
+  } catch (e) { return toast(e.message, true); }
+
+  const host = location.origin + B;
+  const gateway = (await api("/admin/client")).files.includes("tls.crt")
+    ? `${location.hostname}:8444` : "<网关地址>";
+
+  const cmd = [
+    "# 1. 下载启动器和证书（只需一次）",
+    `curl -H "x-admin-token: ${TOKEN}" -o claude-box "${host}/admin/client/claude-box"`,
+    `curl -H "x-admin-token: ${TOKEN}" -o gateway-ca.pem "${host}/admin/client/tls.crt"`,
+    "chmod +x claude-box",
+    "",
+    "# 2. 启动（每次用这个）",
+    `CCE_TUNNEL_CA=./gateway-ca.pem ./claude-box cli \\`,
+    `  --key ${key.card_key} \\`,
+    `  --secret ${key.tunnel_secret} \\`,
+    `  --host ${host} --gateway ${gateway}`,
+  ].join("\n");
+
+  showModal(`
+    <h2>交付给客户</h2>
+    <div class="sub">把下面整段发给客户，30 天后失效</div>
+    <pre id="cmd">${esc(cmd)}</pre>
+    <div class="note">有效期到 ${esc(key.expires_at.slice(0, 10))}。对方需要 Linux / macOS，Windows 需改用 PowerShell 语法。</div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal()">关闭</button>
+      <button class="btn btn-primary" id="copy">复制全部</button>
+    </div>`);
+  $("#copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(cmd); toast("已复制"); }
+    catch { toast("浏览器拒绝了剪贴板，请手动选中", true); }
+  };
+  loadFleet();
+}
+
+async function credential(id) {
+  showModal(`
+    <h2>凭证</h2>
+    <div class="sub">二选一：在服务器上自动登录，或导入已有的 .claude</div>
+    <div class="field">
+      <label>方式一 · 自动登录</label>
+      <button class="btn" id="sync">开始自动登录</button>
+      <div class="hint">会打开浏览器走 Claude 登录，遇到验证码要人工点。最长几分钟。</div>
+    </div>
+    <div class="field">
+      <label>方式二 · 导入已有目录</label>
+      <input id="imp-path" placeholder="/home/deploy/cce/imp/.claude">
+      <div class="hint">服务器上已经存在的 .claude 目录路径</div>
+      <button class="btn btn-sm" id="imp" style="margin-top:8px">导入</button>
+    </div>
+    <div class="modal-foot"><button class="btn" onclick="closeModal()">关闭</button></div>`);
+
+  $("#sync").onclick = async () => {
+    toast("正在登录，可能要几分钟…");
+    try { await api(`/admin/profiles/${id}/sync-credentials`, { method: "POST" }); toast("完成"); }
+    catch (e) { toast(e.message, true); }
+    loadFleet();
+  };
+  $("#imp").onclick = async () => {
+    const path = $("#imp-path").value.trim();
+    if (!path) return toast("填目录路径", true);
+    try {
+      const r = await api(`/admin/profiles/${id}/import-credentials`, {
+        method: "POST", body: JSON.stringify({ path }),
+      });
+      toast(`已导入 ${r.bytes} 字节`);
+      if (r.bytes > 200000) toast("体积偏大，可能打错了目录", true);
+    } catch (e) { toast(e.message, true); }
+    loadFleet();
+  };
+}
+
+/* -- add account --------------------------------------------------------- */
+
+$("#btn-add").onclick = () => {
+  showModal(`
+    <h2>添加账号</h2>
+    <div class="sub">一个账号对应一条固定住宅 IP</div>
+    <div class="field"><label>账号名</label>
+      <input id="n-id" placeholder="acct-001"></div>
+    <div class="field"><label>住宅代理</label>
+      <input id="n-proxy" placeholder="socks5://user:pass@1.2.3.4:1080">
+      <div class="hint">格式 socks5:// 或 http://，含账号密码</div></div>
+    <div class="field"><label>该代理的出口 IP</label>
+      <input id="n-ip" placeholder="203.0.113.7">
+      <div class="hint">必须和代理真实出口一致，否则会被拦截</div></div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="n-save">创建</button>
+    </div>`);
+  $("#n-save").onclick = async () => {
+    const body = {
+      profile_id: $("#n-id").value.trim(),
+      upstream_proxy_url: $("#n-proxy").value.trim(),
+      expected_ip: $("#n-ip").value.trim(),
+    };
+    if (!body.profile_id || !body.upstream_proxy_url || !body.expected_ip)
+      return toast("三项都要填", true);
+    try {
+      await api("/admin/profiles", { method: "POST", body: JSON.stringify(body) });
+      closeModal(); toast("已创建"); loadFleet();
+    } catch (e) { toast(e.message, true); }
+  };
+};
+
+/* -- clients ------------------------------------------------------------- */
+
+async function loadClients() {
+  let data;
+  try { data = await api("/admin/client"); } catch { return; }
+  const files = data.files || [];
+  $("#client-note").textContent = files.length
+    ? "客户首次运行时需要这两个文件"
+    : "服务器上还没有放客户端程序（把二进制放到服务器 bin 目录）";
+  $("#client-links").innerHTML = files.map((f) =>
+    `<a class="btn btn-sm" href="${B}/admin/client/${encodeURIComponent(f)}" target="_blank">${esc(f)}</a>`).join("");
+}
+
+/* -- misc ---------------------------------------------------------------- */
+
+function showModal(html) {
+  $("#modal").innerHTML = html;
+  $("#modal-bg").classList.add("open");
+}
+function closeModal() { $("#modal-bg").classList.remove("open"); }
+window.closeModal = closeModal;
+$("#modal-bg").onclick = (e) => { if (e.target.id === "modal-bg") closeModal(); };
+
+document.querySelectorAll(".tab").forEach((t) => {
+  t.onclick = () => {
+    document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("on", x === t));
+    $("#tab-fleet").classList.toggle("hidden", t.dataset.tab !== "fleet");
+    $("#tab-client").classList.toggle("hidden", t.dataset.tab !== "client");
+  };
+});
+$("#btn-refresh").onclick = () => { loadFleet(); toast("已刷新"); };
+
+if (TOKEN) { api("/admin/profiles").then(enter).catch(() => logout()); }
+</script>
+</body>
+</html>

@@ -492,3 +492,36 @@ async def test_admin_release_frees_a_stuck_row(client: httpx.AsyncClient) -> Non
     assert body["status"] == "IDLE"
     profile = (await client.get("/admin/profiles/acct-api", headers=admin())).json()
     assert profile["status"] == "IDLE"
+
+
+@pytest.mark.asyncio
+async def test_console_page_is_served(client: httpx.AsyncClient) -> None:
+    response = await client.get("/ui")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Claude 账号管理台" in response.text
+
+
+@pytest.mark.asyncio
+async def test_root_serves_html_to_browsers_and_json_to_tools(client: httpx.AsyncClient) -> None:
+    html = await client.get("/", headers={"accept": "text/html"})
+    assert html.status_code == 200 and "账号管理台" in html.text
+    js = await client.get("/", headers={"accept": "application/json"})
+    assert js.json()["console"] == "/ui"
+
+
+@pytest.mark.asyncio
+async def test_client_files_are_listed_and_downloadable(client: httpx.AsyncClient, monkeypatch) -> None:
+    from api import app as app_module
+
+    folder = app_module.Path(app_module.state.db.path).parent / "clients"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "claude-box").write_bytes(b"\x7fELF fake")
+
+    listing = await client.get("/admin/client", headers=admin())
+    assert "claude-box" in listing.json()["files"]
+
+    assert (await client.get("/admin/client/claude-box")).status_code == 401
+    got = await client.get("/admin/client/claude-box", headers=admin())
+    assert got.status_code == 200 and got.content == b"\x7fELF fake"
+    assert (await client.get("/admin/client/nope", headers=admin())).status_code == 404
