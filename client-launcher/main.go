@@ -18,6 +18,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -140,8 +141,73 @@ type fingerprintSpec struct {
 	CamoufoxConfig map[string]any `json:"camoufox_config"`
 }
 
+// bundle is the per-customer config shipped beside the binary. Double-clicking
+// the exe is then the whole onboarding: no terminal, no flags, no memorised URL.
+type bundle struct {
+	Key     string `json:"key"`
+	Secret  string `json:"secret"`
+	Host    string `json:"host"`
+	Gateway string `json:"gateway"`
+	// CA is resolved against the executable's own directory.
+	CA     string `json:"ca"`
+	Mode   string `json:"mode"`
+	Claude string `json:"claude"`
+}
+
+// loadBundle reads cce.json from the directory holding the executable.
+func loadBundle() (*bundle, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(exe), "cce.json"))
+	if err != nil {
+		return nil, err
+	}
+	var b bundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, fmt.Errorf("cce.json is malformed: %w", err)
+	}
+	if b.Key == "" || b.Secret == "" || b.Host == "" {
+		return nil, errors.New("cce.json is missing key, secret or host")
+	}
+	if b.CA != "" && !filepath.IsAbs(b.CA) {
+		b.CA = filepath.Join(filepath.Dir(exe), b.CA)
+	}
+	if b.Mode == "" {
+		b.Mode = "cli"
+	}
+	return &b, nil
+}
+
 func main() {
 	log.SetFlags(log.Ltime)
+
+	// Double-clicked (no arguments): the shipped cce.json supplies everything.
+	// Running it by hand with flags still works exactly as before.
+	var shipped *bundle
+	if len(os.Args) < 2 {
+		loaded, err := loadBundle()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "claude-box: no arguments and no usable cce.json beside the binary: %v\n\n", err)
+			usage()
+			os.Exit(2)
+		}
+		shipped = loaded
+		os.Args = append(os.Args, loaded.Mode)
+		if loaded.CA != "" {
+			_ = os.Setenv("CCE_TUNNEL_CA", loaded.CA)
+		}
+		// A double-click closes the window the moment the process ends, taking
+		// any error with it. Hold it open.
+		if runtime.GOOS == "windows" {
+			defer func() {
+				fmt.Fprint(os.Stderr, "\n按回车关闭…")
+				_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+			}()
+		}
+	}
+
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -163,11 +229,22 @@ func main() {
 	// the launcher's own flags must not leak into the child.
 	set := flag.NewFlagSet(mode, flag.ContinueOnError)
 	set.SetOutput(io.Discard)
-	key := set.String("key", "", "delivery card key from the order email")
-	secret := set.String("secret", envOr("CCE_TUNNEL_SECRET", ""), "delivery tunnel secret")
-	host := set.String("host", envOr("CCE_HOST", ""), "control plane base URL")
-	gateway := set.String("gateway", envOr("CCE_GATEWAY", ""), "gateway host:port override")
-	claudeBin := set.String("claude", "claude", "path to the claude binary")
+	seed := func(value string, read func() string) string {
+		if shipped != nil {
+			return read()
+		}
+		return value
+	}
+	key := set.String("key", seed("", func() string { return shipped.Key }), "delivery card key from the order email")
+	secret := set.String("secret", seed(envOr("CCE_TUNNEL_SECRET", ""), func() string { return shipped.Secret }), "delivery tunnel secret")
+	host := set.String("host", seed(envOr("CCE_HOST", ""), func() string { return shipped.Host }), "control plane base URL")
+	gateway := set.String("gateway", seed(envOr("CCE_GATEWAY", ""), func() string { return shipped.Gateway }), "gateway host:port override")
+	claudeBin := set.String("claude", seed("claude", func() string {
+		if shipped.Claude != "" {
+			return shipped.Claude
+		}
+		return "claude"
+	}), "path to the claude binary")
 	runtimeDir := set.String("runtime", "", "desktop mode: directory holding the browser kernel")
 	verbose := set.Bool("v", false, "verbose")
 	own, claudeArgs := splitArgs(os.Args[2:], func(name string) bool {
@@ -633,6 +710,25 @@ func (p *loopback) trace(format string, args ...any) {
 
 // -- cli mode --------------------------------------------------------------
 
+// findClaude resolves the CLI. A bare name goes through PATH, but a customer
+// who dropped `claude.exe` next to the launcher should not need to touch PATH
+// at all, so the executable's own directory is searched first.
+func findClaude(want string) (string, error) {
+	if strings.ContainsRune(want, os.PathSeparator) || strings.Contains(want, "/") {
+		return want, nil
+	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, name := range []string{want, want + ".exe", want + ".bat", want + ".cmd"} {
+			candidate := filepath.Join(dir, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				return candidate, nil
+			}
+		}
+	}
+	return exec.LookPath(want)
+}
+
 func runCLI(ctx context.Context, client *apiClient, sess *session, root string, proxy *loopback, claudeBin string, claudeArgs []string) error {
 	reported := false
 	defer func() {
@@ -650,7 +746,7 @@ func runCLI(ctx context.Context, client *apiClient, sess *session, root string, 
 	// kills the child and runCLI still returns normally.
 	defer func() { _ = os.RemoveAll(filepath.Join(root, "profiles", sess.ProfileID)) }()
 
-	binary, err := exec.LookPath(claudeBin)
+	binary, err := findClaude(claudeBin)
 	if err != nil {
 		return fmt.Errorf("claude binary not found (%s); install the Claude CLI first", claudeBin)
 	}

@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import json
 import os
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -266,6 +269,78 @@ def create_app() -> FastAPI:
     async def list_clients() -> dict[str, Any]:
         return {"files": list(_client_files())}
 
+    @app.get("/admin/bundle/{profile_id}", dependencies=[admin])
+    async def download_bundle(
+        request: Request, profile_id: str, os_name: str = "windows"
+    ) -> Response:
+        """One-click handover: a zip that runs by double-clicking.
+
+        Ships the launcher, the gateway CA and a `cce.json` carrying this
+        profile's credentials, so the customer needs no terminal and no flags.
+        """
+        if await state.db.get_profile(profile_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "profile not found")
+
+        binary_name = {
+            "windows": "claude-box-windows-x64.exe",
+            "linux": "claude-box",
+            "darwin-arm64": "claude-box-darwin-arm64",
+            "darwin-x64": "claude-box-darwin-x64",
+        }.get(os_name, "claude-box-windows-x64.exe")
+        binary = _client_files().get(binary_name)
+        if binary is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"no {os_name} client published yet")
+        ca = _client_files().get("tls.crt")
+        if ca is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "gateway CA not published yet")
+
+        card_key = new_card_key()
+        tunnel_secret = new_token(18)
+        expires = (_now() + timedelta(days=30)).isoformat()
+        await state.db.insert_delivery_key(
+            {
+                "card_key": card_key,
+                "profile_id": profile_id,
+                "plan_tier": "pro",
+                "tunnel_secret": tunnel_secret,
+                "expires_at": expires,
+            }
+        )
+        await _export_secrets()
+
+        gateway_host = TUNNEL_HOST or "127.0.0.1"
+        manifest = {
+            "key": card_key,
+            "secret": tunnel_secret,
+            "host": request_base(request).rstrip("/"),
+            "gateway": f"{gateway_host}:{TUNNEL_PORT}",
+            "ca": "gateway-ca.pem",
+        }
+
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("cce.json", json.dumps(manifest, indent=2))
+            archive.writestr("gateway-ca.pem", ca.read_bytes())
+            archive.write(binary, binary_name)
+            readme = (
+                "双击 claude-box-windows-x64.exe 就能用，不用输任何命令。\r\n"
+                "\r\n"
+                f"有效期到 {expires[:10]}，过期请联系卖家续期。\r\n"
+                "\r\n"
+                "如果提示找不到 claude：\r\n"
+                "  1. 先装 Claude Code 官方客户端；或\r\n"
+                "  2. 把 claude.exe 复制到本文件夹，再双击一次。\r\n"
+                "\r\n"
+                "跑完窗口会停住，按回车关闭。\r\n"
+            )
+            archive.writestr("请先看我.txt", readme.encode("utf-8"))
+
+        return Response(
+            content=out.getvalue(),
+            media_type="application/zip",
+            headers={"content-disposition": f'attachment; filename="{profile_id}.zip"'},
+        )
+
     @app.get("/admin/client/{name}", dependencies=[admin])
     async def download_client(name: str) -> FileResponse:
         """Serve a launcher binary and the gateway CA from the state directory."""
@@ -489,6 +564,14 @@ async def _export_secrets(*, force: bool = False) -> dict[str, Any]:
     return await export_secrets(state.db, force=force)
 
 
+def request_base(request: Request) -> str:
+    """Public base URL of this deployment, honouring a reverse proxy."""
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    prefix = os.environ.get("CCE_PUBLIC_PREFIX", "")
+    return f"{proto}://{host}{prefix}"
+
+
 def _client_files() -> dict[str, Path]:
     """Files an operator published for customers, keyed by name."""
     if not CLIENT_DIR.is_dir():
@@ -509,8 +592,6 @@ def _public_profile(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _json_or_none(value: str | None) -> Any:
-    import json
-
     if not value:
         return None
     try:

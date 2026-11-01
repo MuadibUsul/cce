@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -525,3 +526,37 @@ async def test_client_files_are_listed_and_downloadable(client: httpx.AsyncClien
     got = await client.get("/admin/client/claude-box", headers=admin())
     assert got.status_code == 200 and got.content == b"\x7fELF fake"
     assert (await client.get("/admin/client/nope", headers=admin())).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_bundle_ships_a_double_clickable_zip(client: httpx.AsyncClient) -> None:
+    """The whole point is that a customer never types a flag."""
+    import io
+    import zipfile
+
+    from api import app as app_module
+
+    await _create_profile(client)
+    folder = app_module.Path(app_module.state.db.path).parent / "clients"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "claude-box-windows-x64.exe").write_bytes(b"MZfake")
+    (folder / "tls.crt").write_text("PEM")
+
+    got = await client.get("/admin/bundle/acct-api", headers=admin())
+    assert got.status_code == 200
+    assert got.headers["content-type"] == "application/zip"
+
+    with zipfile.ZipFile(io.BytesIO(got.content)) as archive:
+        names = set(archive.namelist())
+        assert "cce.json" in names and "gateway-ca.pem" in names
+        assert "claude-box-windows-x64.exe" in names
+        manifest = json.loads(archive.read("cce.json"))
+    assert manifest["key"] and manifest["secret"]
+    assert manifest["gateway"].endswith(":8443")
+    assert manifest["ca"] == "gateway-ca.pem"
+
+
+@pytest.mark.asyncio
+async def test_bundle_needs_a_published_client(client: httpx.AsyncClient) -> None:
+    await _create_profile(client)
+    assert (await client.get("/admin/bundle/acct-api", headers=admin())).status_code == 409

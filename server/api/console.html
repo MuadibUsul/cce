@@ -254,6 +254,7 @@ async function loadFleet() {
 function card(p) {
   const [label, cls] = STATUS[p.status] || [p.status, "p-dead"];
   const trouble = p.status === "PROXY_DEAD" || p.status === "AUTH_EXPIRED";
+  const ready = p.status === "IDLE" && p.has_credentials;
 
   return `<div class="card">
     <div class="card-top">
@@ -264,9 +265,17 @@ function card(p) {
       <span class="pill ${cls}">${label}</span>
     </div>
     ${p.has_credentials ? "" : `<div class="note">⚠ 还没导入登录凭证，现在交付客户会打不开</div>`}
-    ${trouble ? `<div class="note">出口 IP 变了或登录失效，先改好再< b>释放</b>。</div>` : ""}
+    ${trouble ? `<div class="note">出口 IP 变了或登录失效，先改好再释放。</div>` : ""}
     <div class="actions">
-      <button class="btn btn-primary btn-sm" data-act="deliver" data-id="${esc(p.profile_id)}"
+      <button class="btn btn-primary btn-sm" data-act="bundle" data-id="${esc(p.profile_id)}"
+        ${ready ? "" : "disabled"}>下载客户端包</button>
+      <button class="btn btn-sm" data-act="deliver" data-id="${esc(p.profile_id)}">命令方式</button>
+      <button class="btn btn-sm" data-act="credential" data-id="${esc(p.profile_id)}">凭证</button>
+      <button class="btn btn-sm" data-act="preflight" data-id="${esc(p.profile_id)}">检测出口</button>
+      <button class="btn btn-sm btn-danger" data-act="release" data-id="${esc(p.profile_id)}">释放</button>
+    </div>
+  </div>`;
+}
         ${p.status === "IDLE" && p.has_credentials ? "" : "disabled"}>交付给客户</button>
       <button class="btn btn-sm" data-act="credential" data-id="${esc(p.profile_id)}">凭证</button>
       <button class="btn btn-sm" data-act="preflight" data-id="${esc(p.profile_id)}">检测出口</button>
@@ -285,6 +294,27 @@ async function act(kind, id) {
     return;
   }
   if (kind === "deliver") return deliver(id);
+  if (kind === "bundle") {
+    const os = /Win/i.test(navigator.platform) ? "windows" : "linux";
+    toast("正在生成客户端包…");
+    // The endpoint mints a fresh key and streams a zip; a plain link would not
+    // carry the admin header, so fetch and hand the blob to the browser.
+    try {
+      const res = await fetch(`${B}/admin/bundle/${id}?os_name=${os}`, {
+        headers: { "x-admin-token": TOKEN },
+      });
+      if (!res.ok) throw new Error((await res.json()).detail || res.status);
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${id}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast("已下载，解压后双击即可");
+    } catch (e) { toast(e.message, true); }
+    loadFleet();
+    return;
+  }
   if (kind === "credential") return credential(id);
   if (kind === "preflight") {
     toast("正在检测出口…");

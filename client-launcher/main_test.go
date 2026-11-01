@@ -1046,3 +1046,59 @@ func TestEnvStillOverridesTheBakedDefault(t *testing.T) {
 		t.Errorf("fetched %q, want /override", asked)
 	}
 }
+
+// TestBundleSuppliesDefaultsWhenDoubleClicked: a shipped cce.json has to fill
+// key, secret, host and the CA path so a double-click needs no flags at all.
+func TestBundleSuppliesDefaultsWhenDoubleClicked(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"key":"k1","secret":"s1","host":"https://cp.example.com","gateway":"gw:8444","ca":"ca.pem"}`
+	if err := os.WriteFile(filepath.Join(dir, "cce.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cert := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(cert, []byte("pem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	exe, _ := os.Executable()
+	restore, _ := os.Getwd()
+	defer os.Chdir(restore)
+
+	// loadBundle reads beside the executable, so point os.Executable at the temp
+	// dir by copying the manifest next to the real test binary.
+	realDir := filepath.Dir(exe)
+	if err := os.WriteFile(filepath.Join(realDir, "cce.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(filepath.Join(realDir, "cce.json"))
+
+	got, err := loadBundle()
+	if err != nil {
+		t.Fatalf("loadBundle: %v", err)
+	}
+	if got.Key != "k1" || got.Secret != "s1" || got.Host != "https://cp.example.com" {
+		t.Fatalf("bundle = %+v", got)
+	}
+	if got.Mode != "cli" {
+		t.Errorf("mode default = %q", got.Mode)
+	}
+	if !filepath.IsAbs(got.CA) {
+		t.Errorf("CA should be resolved to an absolute path, got %q", got.CA)
+	}
+}
+
+func TestBundleRejectsIncompleteManifest(t *testing.T) {
+	dir := t.TempDir()
+	exe, _ := os.Executable()
+	realDir := filepath.Dir(exe)
+
+	if err := os.WriteFile(filepath.Join(realDir, "cce.json"), []byte(`{"key":"k"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(filepath.Join(realDir, "cce.json"))
+
+	if _, err := loadBundle(); err == nil {
+		t.Fatal("a manifest without secret/host should be refused")
+	}
+	_ = dir
+}
