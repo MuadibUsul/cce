@@ -306,31 +306,65 @@ async function deliver(id) {
   const host = location.origin + B;
   const gateway = (await api("/admin/client")).files.includes("tls.crt")
     ? `${location.hostname}:8444` : "<网关地址>";
+  const files = (await api("/admin/client")).files;
+  const win = files.includes("claude-box-windows-x64.exe");
+  const nix = files.includes("claude-box");
 
-  const cmd = [
-    "# 1. 下载启动器和证书（只需一次）",
-    `curl -H "x-admin-token: ${TOKEN}" -o claude-box "${host}/admin/client/claude-box"`,
-    `curl -H "x-admin-token: ${TOKEN}" -o gateway-ca.pem "${host}/admin/client/tls.crt"`,
-    "chmod +x claude-box",
-    "",
-    "# 2. 启动（每次用这个）",
-    `CCE_TUNNEL_CA=./gateway-ca.pem ./claude-box cli \\`,
-    `  --key ${key.card_key} \\`,
-    `  --secret ${key.tunnel_secret} \\`,
-    `  --host ${host} --gateway ${gateway}`,
-  ].join("\n");
+  const build = (os) => {
+    if (os === "win") {
+      return [
+        "# 1. 下载启动器和证书（只需一次），放到同一个文件夹",
+        `curl.exe -H "x-admin-token: ${TOKEN}" -o claude-box.exe "${host}/admin/client/claude-box-windows-x64.exe"`,
+        `curl.exe -H "x-admin-token: ${TOKEN}" -o gateway-ca.pem "${host}/admin/client/tls.crt"`,
+        "",
+        "# 2. 在该文件夹里打开 PowerShell，每次用这个",
+        `$env:CCE_TUNNEL_CA="$PWD\\gateway-ca.pem"`,
+        `.\\claude-box.exe cli \``,
+        `  --key ${key.card_key} \``,
+        `  --secret ${key.tunnel_secret} \``,
+        `  --host ${host} --gateway ${gateway}`,
+      ].join("\n");
+    }
+    return [
+      "# 1. 下载启动器和证书（只需一次）",
+      `curl -H "x-admin-token: ${TOKEN}" -o claude-box "${host}/admin/client/claude-box"`,
+      `curl -H "x-admin-token: ${TOKEN}" -o gateway-ca.pem "${host}/admin/client/tls.crt"`,
+      "chmod +x claude-box",
+      "",
+      "# 2. 启动（每次用这个）",
+      `CCE_TUNNEL_CA=./gateway-ca.pem ./claude-box cli \\`,
+      `  --key ${key.card_key} \\`,
+      `  --secret ${key.tunnel_secret} \\`,
+      `  --host ${host} --gateway ${gateway}`,
+    ].join("\n");
+  };
+
+  const start = win && /Win/i.test(navigator.platform) ? "win" : "nix";
+  let current = build(start);
 
   showModal(`
     <h2>交付给客户</h2>
-    <div class="sub">把下面整段发给客户，30 天后失效</div>
-    <pre id="cmd">${esc(cmd)}</pre>
-    <div class="note">有效期到 ${esc(key.expires_at.slice(0, 10))}。对方需要 Linux / macOS，Windows 需改用 PowerShell 语法。</div>
+    <div class="sub">选对方的系统，把下面整段发过去。30 天后失效</div>
+    <div class="tabs" style="margin-bottom:14px">
+      ${nix ? `<button class="tab ${start === "nix" ? "on" : ""}" data-os="nix">Linux / macOS</button>` : ""}
+      ${win ? `<button class="tab ${start === "win" ? "on" : ""}" data-os="win">Windows</button>` : ""}
+    </div>
+    <pre id="cmd">${esc(current)}</pre>
+    <div class="note">有效期到 ${esc(key.expires_at.slice(0, 10))}。${win ? "" : "服务器上还没放 Windows 客户端。"}</div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal()">关闭</button>
       <button class="btn btn-primary" id="copy">复制全部</button>
     </div>`);
+
+  $("#modal").querySelectorAll("[data-os]").forEach((t) => {
+    t.onclick = () => {
+      current = build(t.dataset.os);
+      $("#cmd").textContent = current;
+      $("#modal").querySelectorAll("[data-os]").forEach((x) => x.classList.toggle("on", x === t));
+    };
+  });
   $("#copy").onclick = async () => {
-    try { await navigator.clipboard.writeText(cmd); toast("已复制"); }
+    try { await navigator.clipboard.writeText(current); toast("已复制"); }
     catch { toast("浏览器拒绝了剪贴板，请手动选中", true); }
   };
   loadFleet();
@@ -408,15 +442,29 @@ $("#btn-add").onclick = () => {
 
 /* -- clients ------------------------------------------------------------- */
 
+const LABELS = {
+  "claude-box": ["Linux 客户端", "启动器"],
+  "claude-box-windows-x64.exe": ["Windows 客户端", "启动器"],
+  "claude-box-darwin-arm64": ["macOS 客户端 (Apple 芯片)", "启动器"],
+  "claude-box-darwin-x64": ["macOS 客户端 (Intel)", "启动器"],
+  "tls.crt": ["网关证书", "两个平台都要，必下"],
+};
+
 async function loadClients() {
   let data;
   try { data = await api("/admin/client"); } catch { return; }
   const files = data.files || [];
   $("#client-note").textContent = files.length
-    ? "客户首次运行时需要这两个文件"
-    : "服务器上还没有放客户端程序（把二进制放到服务器 bin 目录）";
-  $("#client-links").innerHTML = files.map((f) =>
-    `<a class="btn btn-sm" href="${B}/admin/client/${encodeURIComponent(f)}" target="_blank">${esc(f)}</a>`).join("");
+    ? "把对应平台的文件和证书发给客户，客户端下载后可直接运行"
+    : "服务器上还没有放客户端程序";
+  $("#client-links").innerHTML = files.map((f) => {
+    const [title, hint] = LABELS[f] || [f, ""];
+    return `<a class="card" style="text-decoration:none;color:inherit;display:block;padding:13px 15px"
+      href="${B}/admin/client/${encodeURIComponent(f)}" download>
+      <div class="name" style="font-size:13.5px">${esc(title)}</div>
+      <div class="meta">${esc(f)}${hint ? " · " + esc(hint) : ""}</div>
+    </a>`;
+  }).join("");
 }
 
 /* -- misc ---------------------------------------------------------------- */
